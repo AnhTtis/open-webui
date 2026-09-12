@@ -52,14 +52,14 @@ export const uploadFile = async (
 				.pipeThrough(splitStream('\n'))
 				.getReader();
 
-			while (true) {
+			for (;;) {
 				const { value, done } = await reader.read();
 				if (done) {
 					break;
 				}
 
 				try {
-					let lines = value.split('\n');
+					const lines = value.split('\n');
 
 					for (const line of lines) {
 						if (line !== '') {
@@ -67,7 +67,7 @@ export const uploadFile = async (
 							if (line === 'data: [DONE]') {
 								console.log(line);
 							} else {
-								let data = JSON.parse(line.replace(/^data: /, ''));
+								const data = JSON.parse(line.replace(/^data: /, ''));
 								console.log(data);
 
 								if (data?.error) {
@@ -312,32 +312,51 @@ export const updateFileDataContentById = async (token: string, id: string, conte
 	return res;
 };
 
-export const getFileContentById = async (id: string) => {
-	let error = null;
+export const getFilePreviewById = async (token: string, id: string) => {
+	const res = await fetch(`${WEBUI_API_BASE_URL}/files/${id}/preview`, {
+		method: 'GET',
+		headers: {
+			Accept: 'application/pdf',
+			...(token ? { authorization: `Bearer ${token}` } : {})
+		},
+		credentials: 'include'
+	});
 
+	if (!res.ok) {
+		let detail = `Failed to generate file preview (HTTP ${res.status})`;
+		try {
+			const body = await res.json();
+			detail = body?.detail ?? detail;
+		} catch {
+			// Preserve the status-based fallback when the response is not JSON.
+		}
+		throw new Error(detail);
+	}
+
+	return await res.arrayBuffer();
+};
+
+export const getFileContentById = async (id: string): Promise<ArrayBuffer> => {
 	const res = await fetch(`${WEBUI_API_BASE_URL}/files/${id}/content`, {
 		method: 'GET',
 		headers: {
-			Accept: 'application/json'
+			Accept: 'application/octet-stream'
 		},
 		credentials: 'include'
-	})
-		.then(async (res) => {
-			if (!res.ok) throw await res.json();
-			return await res.arrayBuffer();
-		})
-		.catch((err) => {
-			error = err.detail;
-			console.error(err);
+	});
 
-			return null;
-		});
-
-	if (error) {
-		throw error;
+	if (!res.ok) {
+		let detail = `Failed to download file (HTTP ${res.status})`;
+		try {
+			const body = await res.json();
+			detail = body?.detail ?? detail;
+		} catch {
+			// Preserve the status-based fallback when the response is not JSON.
+		}
+		throw new Error(detail);
 	}
 
-	return res;
+	return await res.arrayBuffer();
 };
 
 export const renameFileById = async (token: string, id: string, filename: string) => {

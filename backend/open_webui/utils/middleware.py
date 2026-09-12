@@ -86,6 +86,11 @@ from open_webui.utils.chat import generate_chat_completion
 from open_webui.utils.chat_id import is_saved_chat_id
 from open_webui.utils.code_interpreter import execute_code_jupyter
 from open_webui.utils.context_compaction import compact_messages_for_request
+from open_webui.utils.reasoning_parser import (
+    TaggedOutputState,
+    finalize_reasoning_items,
+    finalize_stream_reasoning_items,
+)
 from open_webui.utils.files import (
     convert_markdown_base64_images,
     get_file_url_from_base64,
@@ -242,12 +247,6 @@ DEFAULT_REASONING_TAGS = [
 
 DEFAULT_SOLUTION_TAGS = [('<|begin_of_solution|>', '<|end_of_solution|>')]
 DEFAULT_CODE_INTERPRETER_TAGS = [('<code_interpreter>', '</code_interpreter>')]
-
-
-def _start_tag_pattern(start_tag: str) -> str:
-    if start_tag.startswith('<') and start_tag.endswith('>'):
-        return rf'<{re.escape(start_tag[1:-1])}(\s.*?)?>'
-    return re.escape(start_tag)
 
 
 def output_id(prefix: str) -> str:
@@ -3114,6 +3113,12 @@ async def process_chat_payload(request, form_data, user, metadata, model):
 
     form_data = normalize_messages_for_model(form_data)
 
+    # Re-check the final provider payload after memory, tools, plugins and
+    # file/RAG source context have all been added.
+    from open_webui.utils.context_budget import enforce_final_context_budget
+
+    form_data = enforce_final_context_budget(form_data, model, metadata)
+
     return form_data, metadata, events
 
 
@@ -4256,287 +4261,8 @@ async def streaming_chat_response_handler(response, ctx):
         # Handle as a background task
         async def response_handler(response, events):
             filter_context = FilterContext()
-            tag_scan_positions = {}
-            tag_boundary_positions = {}
             response_stream_task_id = metadata.get('task_id') or metadata.get('message_id')
-
-            def tag_output_handler(content_type, tags, output):
-                """
-                Detect special tags (reasoning, solution, code_interpreter) in streaming
-                content and create corresponding OR-aligned output items directly.
-                Operates on output items instead of content_blocks.
-
-                Uses the text from the output items themselves for tag detection,
-                eliminating state divergence between accumulated content and items.
-                """
-                end_flag = False
-
-                def extract_attributes(tag_content):
-                    """Extract attributes from a tag if they exist."""
-                    attributes = {}
-                    if not tag_content:
-                        return attributes
-                    matches = re.findall(r'(\w+)\s*=\s*"([^"]+)"', tag_content)
-                    for key, value in matches:
-                        attributes[key] = value
-                    return attributes
-
-                def get_last_text(out):
-                    """Get text from last message item, or empty string."""
-                    if out and out[-1].get('type') == 'message':
-                        parts = out[-1].get('content', [])
-                        if parts and parts[-1].get('type') == 'output_text':
-                            return parts[-1].get('text', '')
-                    return ''
-
-                def set_last_text(out, text):
-                    """Set text on last message item's output_text."""
-                    if out and out[-1].get('type') == 'message':
-                        parts = out[-1].get('content', [])
-                        if parts and parts[-1].get('type') == 'output_text':
-                            parts[-1]['text'] = text
-
-                def get_scanned_length(item, text):
-                    item_id = item.get('id')
-                    if not item_id:
-                        return 0
-
-                    scanned_length = tag_scan_positions.get((item_id, content_type), 0)
-                    return scanned_length if scanned_length <= len(text) else 0
-
-                def save_scanned_length(item, text):
-                    item_id = item.get('id')
-                    if item_id:
-                        tag_scan_positions[(item_id, content_type)] = len(text)
-
-                def clear_scanned_length(item):
-                    item_id = item.get('id')
-                    if item_id:
-                        tag_scan_positions.pop((item_id, content_type), None)
-                        tag_boundary_positions.pop((item_id, content_type), None)
-
-                def get_tag_boundaries(item, text, scanned_length):
-                    """Index of the last '<', and of the last '>' or newline, before scanned_length."""
-                    key = (item.get('id'), content_type)
-                    scanned, last_open, last_boundary = tag_boundary_positions.get(key, (0, -1, -1))
-                    if scanned > scanned_length:  # the item was rewritten, so the cached positions are stale
-                        scanned, last_open, last_boundary = 0, -1, -1
-
-                    if scanned < scanned_length:
-                        # only text added since the last call can move either position
-                        open_tag = text.rfind('<', scanned, scanned_length)
-                        if open_tag != -1:
-                            last_open = open_tag
-                        boundary = max(
-                            text.rfind('>', scanned, scanned_length),
-                            text.rfind('\n', scanned, scanned_length),
-                        )
-                        if boundary != -1:
-                            last_boundary = boundary
-                        tag_boundary_positions[key] = (scanned_length, last_open, last_boundary)
-
-                    return last_open, last_boundary
-
-                # Map content_type to output item type
-                output_type_map = {
-                    'reasoning': 'reasoning',
-                    'solution': 'message',  # solution tags just produce text
-                    'code_interpreter': 'open_webui:code_interpreter',
-                }
-                output_item_type = output_type_map.get(content_type, content_type)
-
-                last_type = output[-1].get('type', '') if output else ''
-
-                if last_type == 'message':
-                    # Use the output item's own text for tag detection
-                    item = output[-1]
-                    item_text = get_last_text(output)
-                    scanned_length = get_scanned_length(item, item_text)
-                    max_start_tag_length = max((len(start_tag) for start_tag, _ in tags), default=1)
-                    search_start = max(0, scanned_length - max_start_tag_length + 1)
-
-                    if scanned_length and any(
-                        start_tag.startswith('<') and start_tag.endswith('>') for start_tag, _ in tags
-                    ):
-                        open_tag_start, last_tag_boundary = get_tag_boundaries(item, item_text, scanned_length)
-                        if open_tag_start > last_tag_boundary:
-                            search_start = min(search_start, open_tag_start)
-
-                    for start_tag, end_tag in tags:
-                        match = re.compile(_start_tag_pattern(start_tag)).search(item_text, search_start)
-                        if match:
-                            clear_scanned_length(item)
-                            try:
-                                attr_content = match.group(1) if match.group(1) else ''
-                            except Exception:
-                                attr_content = ''
-
-                            attributes = extract_attributes(attr_content)
-
-                            before_tag = item_text[: match.start()]
-                            after_tag = item_text[match.end() :]
-
-                            # Keep only text before the tag in the message
-                            set_last_text(output, before_tag)
-
-                            if not before_tag.strip():
-                                # Remove empty message item
-                                if output and output[-1].get('type') == 'message':
-                                    output.pop()
-
-                            # Append the new output item
-                            if output_item_type == 'reasoning':
-                                output.append(
-                                    {
-                                        'type': 'reasoning',
-                                        'id': output_id('r'),
-                                        'status': 'in_progress',
-                                        'start_tag': start_tag,
-                                        'end_tag': end_tag,
-                                        'attributes': attributes,
-                                        'content': [],
-                                        'summary': None,
-                                        'started_at': time.time(),
-                                    }
-                                )
-                            elif output_item_type == 'open_webui:code_interpreter':
-                                output.append(
-                                    {
-                                        'type': 'open_webui:code_interpreter',
-                                        'id': output_id('ci'),
-                                        'status': 'in_progress',
-                                        'start_tag': start_tag,
-                                        'end_tag': end_tag,
-                                        'attributes': attributes,
-                                        'lang': attributes.get('lang', 'python'),
-                                        'code': '',
-                                        'output': None,
-                                        'started_at': time.time(),
-                                    }
-                                )
-                            else:
-                                # solution or other text-producing tag
-                                output.append(
-                                    {
-                                        'type': 'message',
-                                        'id': output_id('msg'),
-                                        'status': 'in_progress',
-                                        'role': 'assistant',
-                                        'content': [{'type': 'output_text', 'text': ''}],
-                                        '_tag_type': content_type,
-                                        'start_tag': start_tag,
-                                        'end_tag': end_tag,
-                                        'attributes': attributes,
-                                        'started_at': time.time(),
-                                    }
-                                )
-
-                            if after_tag:
-                                # Set the after_tag content on the new item
-                                if output_item_type == 'reasoning':
-                                    output[-1]['content'] = [{'type': 'output_text', 'text': after_tag}]
-                                elif output_item_type == 'open_webui:code_interpreter':
-                                    output[-1]['code'] = after_tag
-                                else:
-                                    set_last_text(output, after_tag)
-
-                                _, recursive_end = tag_output_handler(content_type, tags, output)
-                                if recursive_end:
-                                    end_flag = True
-
-                            break
-                    else:
-                        save_scanned_length(item, item_text)
-
-                elif (
-                    (last_type == 'reasoning' and content_type == 'reasoning')
-                    or (last_type == 'open_webui:code_interpreter' and content_type == 'code_interpreter')
-                    or (last_type == 'message' and output[-1].get('_tag_type') == content_type)
-                ):
-                    item = output[-1]
-                    start_tag = item.get('start_tag', '')
-                    end_tag = item.get('end_tag', '')
-
-                    # Get the block content from the item itself
-                    if last_type == 'reasoning':
-                        parts = item.get('content', [])
-                        block_content = ''
-                        if parts and parts[-1].get('type') == 'output_text':
-                            block_content = parts[-1].get('text', '')
-                    elif last_type == 'open_webui:code_interpreter':
-                        block_content = item.get('code', '')
-                    else:
-                        block_content = get_last_text(output)
-
-                    scanned_length = get_scanned_length(item, block_content)
-                    end_tag_search_start = max(0, scanned_length - max(len(end_tag), 1) + 1)
-
-                    if block_content.find(end_tag, end_tag_search_start) != -1:
-                        clear_scanned_length(item)
-                        end_flag = True
-
-                        # Strip start and end tags from content
-                        start_tag_pattern = _start_tag_pattern(start_tag)
-                        block_content = re.sub(start_tag_pattern, '', block_content).strip()
-
-                        end_tag_pattern = rf'{re.escape(end_tag)}'
-                        end_tag_regex = re.compile(end_tag_pattern, re.DOTALL)
-                        split_content = end_tag_regex.split(block_content, maxsplit=1)
-
-                        block_content = split_content[0].strip() if split_content else ''
-                        leftover_content = split_content[1].strip() if len(split_content) > 1 else ''
-
-                        if block_content:
-                            # Update the item with final content
-                            if last_type == 'reasoning':
-                                item['content'] = [{'type': 'output_text', 'text': block_content}]
-                                item['ended_at'] = time.time()
-                                item['duration'] = int(item['ended_at'] - item['started_at'])
-                                item['status'] = 'completed'
-                            elif last_type == 'open_webui:code_interpreter':
-                                item['code'] = block_content
-                                item['ended_at'] = time.time()
-                                item['duration'] = int(item['ended_at'] - item['started_at'])
-                            else:
-                                set_last_text(output, block_content)
-                                item['ended_at'] = time.time()
-
-                            # Reset by appending a new message item for leftover
-                            output.append(
-                                {
-                                    'type': 'message',
-                                    'id': output_id('msg'),
-                                    'status': 'in_progress',
-                                    'role': 'assistant',
-                                    'content': [
-                                        {
-                                            'type': 'output_text',
-                                            'text': leftover_content,
-                                        }
-                                    ],
-                                }
-                            )
-                        else:
-                            # Remove the block if content is empty
-                            output.pop()
-                            output.append(
-                                {
-                                    'type': 'message',
-                                    'id': output_id('msg'),
-                                    'status': 'in_progress',
-                                    'role': 'assistant',
-                                    'content': [
-                                        {
-                                            'type': 'output_text',
-                                            'text': leftover_content,
-                                        }
-                                    ],
-                                }
-                            )
-                    else:
-                        save_scanned_length(item, block_content)
-
-                return output, end_flag
+            tagged_output_state = TaggedOutputState(output_id=output_id)
 
             message = (
                 await Chats.get_message_by_id_and_message_id(metadata['chat_id'], metadata['message_id'])
@@ -4589,6 +4315,8 @@ async def streaming_chat_response_handler(response, ctx):
                     ]
                 else:
                     output = []
+
+            tagged_output_state.prime_emitted_text(output)
 
             usage = None
             last_response_id = None
@@ -5068,9 +4796,9 @@ async def streaming_chat_response_handler(response, ctx):
                                                             str,
                                                         ):
                                                             current_response_tool_call['function']['arguments'] = ''
-                                                        current_response_tool_call['function']['arguments'] += (
-                                                            delta_arguments
-                                                        )
+                                                        current_response_tool_call['function'][
+                                                            'arguments'
+                                                        ] += delta_arguments
 
                                         # Emit pending tool calls in real-time as Responses events.
                                         if response_tool_calls:
@@ -5182,9 +4910,7 @@ async def streaming_chat_response_handler(response, ctx):
                                     reasoning_detail_items = (
                                         [item for item in reasoning_details if isinstance(item, dict)]
                                         if isinstance(reasoning_details, list)
-                                        else [reasoning_details]
-                                        if isinstance(reasoning_details, dict)
-                                        else []
+                                        else [reasoning_details] if isinstance(reasoning_details, dict) else []
                                     )
                                     existing_reasoning_item = next(
                                         (item for item in reversed(output) if item.get('type') == 'reasoning'),
@@ -5259,6 +4985,7 @@ async def streaming_chat_response_handler(response, ctx):
                                                 'delta': reasoning_content,
                                             }
                                             delta_type = 'response.reasoning_text.delta'
+                                            tagged_output_state.mark_emitted_text(reasoning_item)
 
                                         if reasoning_detail_items:
                                             merge_streamed_reasoning_details(
@@ -5274,6 +5001,10 @@ async def streaming_chat_response_handler(response, ctx):
                                                 data = None
 
                                     if value:
+                                        if data and delta_type == 'response.reasoning_text.delta':
+                                            await queue_pending_delta_data(data, delta_type)
+                                            data = None
+
                                         if (
                                             output
                                             and output[-1].get('type') == 'reasoning'
@@ -5312,15 +5043,16 @@ async def streaming_chat_response_handler(response, ctx):
                                                 user,
                                             )
 
-                                        # closure-cell str += recopies per chunk; append + join once at read is O(n)
-                                        content_parts.append(value)
+                                        # Append only parser-sanitized visible deltas to content_parts below.
+                                        # Raw provider chunks can contain split reasoning/tool markers and
+                                        # must not become canonical assistant content or memory evidence.
 
                                         # Check if we're inside a tag-based block
                                         # (reasoning, code_interpreter, or solution).
                                         # If so, append to the existing in-progress
                                         # item instead of creating a new message —
-                                        # otherwise tag_output_handler re-detects the
-                                        # start tag on every chunk and fragments the
+                                        # otherwise the tagged output state would re-detect
+                                        # the start tag on every chunk and fragment the
                                         # output.
                                         last_item = output[-1] if output else None
                                         last_item_type = last_item.get('type', '') if last_item else ''
@@ -5395,20 +5127,20 @@ async def streaming_chat_response_handler(response, ctx):
                                                 ]
 
                                         if DETECT_REASONING_TAGS:
-                                            output, _ = tag_output_handler(
+                                            output, _ = tagged_output_state.process(
                                                 'reasoning',
                                                 reasoning_tags,
                                                 output,
                                             )
 
-                                            output, _ = tag_output_handler(
+                                            output, _ = tagged_output_state.process(
                                                 'solution',
                                                 DEFAULT_SOLUTION_TAGS,
                                                 output,
                                             )
 
                                         if DETECT_CODE_INTERPRETER:
-                                            output, end = tag_output_handler(
+                                            output, end = tagged_output_state.process(
                                                 'code_interpreter',
                                                 DEFAULT_CODE_INTERPRETER_TAGS,
                                                 output,
@@ -5417,23 +5149,15 @@ async def streaming_chat_response_handler(response, ctx):
                                             if end:
                                                 break
 
-                                        target_index = len(output) - 1
-                                        target_item = output[target_index] if target_index >= 0 else {}
-                                        target_content = target_item.get('content', [])
-                                        content_index = max(len(target_content) - 1, 0)
-                                        delta_event_type = (
-                                            'response.reasoning_text.delta'
-                                            if target_item.get('type') == 'reasoning'
-                                            else 'response.output_text.delta'
-                                        )
-                                        data = {
-                                            'type': delta_event_type,
-                                            'item_id': target_item.get('id'),
-                                            'output_index': target_index,
-                                            'content_index': content_index,
-                                            'delta': value,
-                                        }
-                                        delta_type = delta_event_type
+                                        for safe_delta in tagged_output_state.take_safe_deltas(output):
+                                            item_type = safe_delta.pop('item_type', None)
+                                            if item_type == 'message':
+                                                content_parts.append(safe_delta['delta'])
+                                            await queue_pending_delta_data(
+                                                safe_delta,
+                                                safe_delta['type'],
+                                            )
+                                        data = None
 
                                 if delta and data:
                                     await queue_pending_delta_data(data, delta_type)
@@ -5476,15 +5200,7 @@ async def streaming_chat_response_handler(response, ctx):
                                             }
                                         )
 
-                        if output[-1].get('type') == 'reasoning':
-                            reasoning_item = output[-1]
-                            if reasoning_item.get('ended_at') is None:
-                                reasoning_item['ended_at'] = time.time()
-                                if reasoning_item.get('started_at') is not None:
-                                    reasoning_item['duration'] = int(
-                                        reasoning_item['ended_at'] - reasoning_item['started_at']
-                                    )
-                                reasoning_item['status'] = 'completed'
+                        finalize_stream_reasoning_items(output)
 
                     if response_tool_calls:
                         for tc in response_tool_calls:
@@ -6277,6 +5993,16 @@ async def streaming_chat_response_handler(response, ctx):
                 }
                 await outlet_filter_handler(ctx)
                 await background_tasks_handler(ctx)
+            except Exception as error:
+                finalize_reasoning_items(full_output(), status='incomplete')
+                error_content = get_message_error_content(error)
+                log.exception('Streaming response failed: %s', error_content)
+                try:
+                    await emit_message_error(error_content)
+                    await clear_response_stream(request.app.state.redis, response_stream_task_id)
+                except Exception:
+                    log.exception('Failed to persist streaming error state')
+                raise
             except asyncio.CancelledError:
                 log.warning('Task was cancelled!')
 
@@ -6289,6 +6015,8 @@ async def streaming_chat_response_handler(response, ctx):
                         await asyncio.shield(response.body_iterator.aclose())
                     except (asyncio.CancelledError, Exception):
                         pass
+
+                finalize_reasoning_items(full_output(), status='incomplete')
 
                 async def save_cancelled_state():
                     await event_emitter({'type': 'chat:tasks:cancel'})

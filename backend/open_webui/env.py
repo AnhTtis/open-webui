@@ -1159,6 +1159,15 @@ VIEW_FILE_MAX_CHARS = _int_env('VIEW_FILE_MAX_CHARS', 100_000)
 VIEW_FILE_DEFAULT_MAX_CHARS = _int_env('VIEW_FILE_DEFAULT_MAX_CHARS', 10_000)
 
 ####################################
+# LibreOffice document previews
+####################################
+
+ENABLE_LIBREOFFICE_PREVIEW = os.getenv('ENABLE_LIBREOFFICE_PREVIEW', 'False').lower() == 'true'
+LIBREOFFICE_PATH = os.getenv('LIBREOFFICE_PATH', 'soffice')
+LIBREOFFICE_PREVIEW_TIMEOUT = _int_env('LIBREOFFICE_PREVIEW_TIMEOUT', 30)
+LIBREOFFICE_PREVIEW_MAX_FILE_SIZE = _int_env('LIBREOFFICE_PREVIEW_MAX_FILE_SIZE', 25 * 1024 * 1024)
+
+####################################
 # TOOLS/FUNCTIONS PIP OPTIONS
 ####################################
 

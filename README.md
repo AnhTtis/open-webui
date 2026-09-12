@@ -21,6 +21,8 @@ Passionate about open-source AI? [Join our team →](https://careers.openwebui.c
 
 For more information, be sure to check out our [Open WebUI Documentation](https://docs.openwebui.com/).
 
+For this Windows source checkout, see [Windows development](./docs/WINDOWS_DEVELOPMENT.md), [native architecture and status](./OPEN_WEBUI_NATIVE_ARCHITECTURE_AND_STATUS.md), [local data protection](./OPEN_WEBUI_LOCAL_DATA_AND_PROTECTION.md), and [release gates](./OPEN_WEBUI_RELEASE_GATES.md).
+
 ## Key Features of Open WebUI ⭐
 
 - 🚀 **Effortless Setup**: Install seamlessly via pip, uv, Docker, or Kubernetes (kubectl, kustomize, or helm), with `:ollama` and `:cuda` tagged images available for container deployments.

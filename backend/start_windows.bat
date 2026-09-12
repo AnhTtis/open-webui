@@ -4,18 +4,9 @@ SETLOCAL ENABLEDELAYEDEXPANSION
 
 :: Get the directory of the current script
 SET "SCRIPT_DIR=%~dp0"
-cd /d "%SCRIPT_DIR%" || exit /b
+cd /d "%SCRIPT_DIR%" || exit /b 1
 
-:: Add conditional Playwright browser installation
-IF /I "%WEB_LOADER_ENGINE%" == "playwright" (
-    IF "%PLAYWRIGHT_WS_URL%" == "" (
-        echo Installing Playwright browsers...
-        playwright install chromium
-        playwright install-deps chromium
-    )
-
-    python -c "import nltk; nltk.download('punkt_tab')"
-)
+:: Optional Playwright and NLTK assets are installed explicitly with setup_windows.bat.
 
 SET "KEY_FILE=.webui_secret_key"
 IF NOT "%WEBUI_SECRET_KEY_FILE%" == "" (
@@ -56,5 +47,8 @@ IF "%WEBUI_SECRET_KEY% %WEBUI_JWT_SECRET_KEY%" == " " (
 SET "WEBUI_SECRET_KEY=%WEBUI_SECRET_KEY%"
 IF "%UVICORN_WORKERS%"=="" SET UVICORN_WORKERS=1
 if "%UVICORN_WS_PER_MESSAGE_DEFLATE%" == "" set "UVICORN_WS_PER_MESSAGE_DEFLATE=true"
-uvicorn open_webui.main:app --host "%HOST%" --port "%PORT%" --forwarded-allow-ips %FORWARDED_ALLOW_IPS% --workers %UVICORN_WORKERS% --ws auto --ws-per-message-deflate %UVICORN_WS_PER_MESSAGE_DEFLATE%
-:: For ssl user uvicorn open_webui.main:app --host "%HOST%" --port "%PORT%" --forwarded-allow-ips '*' --ssl-keyfile "key.pem" --ssl-certfile "cert.pem" --ws auto
+:: For SSL, add --ssl-keyfile "key.pem" --ssl-certfile "cert.pem" to this command.
+python -m uvicorn open_webui.main:app --host "%HOST%" --port "%PORT%" --forwarded-allow-ips %FORWARDED_ALLOW_IPS% --workers %UVICORN_WORKERS% --ws auto --ws-per-message-deflate %UVICORN_WS_PER_MESSAGE_DEFLATE%
+SET "EXIT_CODE=%ERRORLEVEL%"
+IF NOT "%EXIT_CODE%" == "0" echo Open WebUI backend exited with code %EXIT_CODE%. 1>&2
+exit /b %EXIT_CODE%

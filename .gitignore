@@ -16,12 +16,16 @@ __pycache__/
 *$py.class
 .nvmrc
 CLAUDE.md
+.codebase-memory/
+.memory-check.log
 # C extensions
 *.so
 
 # Pyodide distribution
 static/pyodide/*
 !static/pyodide/pyodide-lock.json
+static/.pyodide.prepare-*
+static/.pyodide.backup-*
 
 # Distribution / packaging
 .Python

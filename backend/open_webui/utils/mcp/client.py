@@ -67,9 +67,9 @@ class MCPClient:
                 self._streams_context = streamablehttp_client(
                     url,
                     headers=headers,
-                    httpx_client_factory=create_httpx_client
-                    if AIOHTTP_CLIENT_SESSION_TOOL_SERVER_SSL
-                    else create_insecure_httpx_client,
+                    httpx_client_factory=(
+                        create_httpx_client if AIOHTTP_CLIENT_SESSION_TOOL_SERVER_SSL else create_insecure_httpx_client
+                    ),
                 )
 
                 transport = await exit_stack.enter_async_context(self._streams_context)
@@ -89,7 +89,8 @@ class MCPClient:
         if not self.session:
             raise RuntimeError('MCP client is not connected.')
 
-        result = await self.session.list_tools()
+        with anyio.fail_after(AIOHTTP_CLIENT_TIMEOUT_TOOL_SERVER):
+            result = await self.session.list_tools()
         tools = result.tools
 
         tool_specs = []
@@ -110,7 +111,8 @@ class MCPClient:
         if not self.session:
             raise RuntimeError('MCP client is not connected.')
 
-        result = await self.session.call_tool(function_name, function_args)
+        with anyio.fail_after(AIOHTTP_CLIENT_TIMEOUT_TOOL_SERVER):
+            result = await self.session.call_tool(function_name, function_args)
         if not result:
             raise Exception('No result returned from MCP tool call.')
 
@@ -126,7 +128,8 @@ class MCPClient:
         if not self.session:
             raise RuntimeError('MCP client is not connected.')
 
-        result = await self.session.list_resources(cursor=cursor)
+        with anyio.fail_after(AIOHTTP_CLIENT_TIMEOUT_TOOL_SERVER):
+            result = await self.session.list_resources(cursor=cursor)
         if not result:
             raise Exception('No result returned from MCP list_resources call.')
 
@@ -139,7 +142,8 @@ class MCPClient:
         if not self.session:
             raise RuntimeError('MCP client is not connected.')
 
-        result = await self.session.read_resource(uri)
+        with anyio.fail_after(AIOHTTP_CLIENT_TIMEOUT_TOOL_SERVER):
+            result = await self.session.read_resource(uri)
         if not result:
             raise Exception('No result returned from MCP read_resource call.')
         result_dict = result.model_dump()

@@ -201,6 +201,7 @@ exclude = [
     "requirements.txt",
     "start.sh",
     "start_windows.bat",
+    "setup_windows.bat",
     "webui.db",
     "chroma.sqlite3",
 ]
@@ -216,7 +217,7 @@ ignore-words-list = 'ans'
 [dependency-groups]
 dev = [
     "pytest-asyncio>=1.0.0",
-    "ruff>=0.15.5",
+    "ruff==0.15.18",
 ]
 
 [tool.black]

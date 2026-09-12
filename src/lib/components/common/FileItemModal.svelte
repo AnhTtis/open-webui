@@ -8,7 +8,7 @@
 	import { WEBUI_API_BASE_URL } from '$lib/constants';
 	import { settings } from '$lib/stores';
 	import { getKnowledgeById } from '$lib/apis/knowledge';
-	import { getFileById, getFileContentById } from '$lib/apis/files';
+	import { getFileById, getFileContentById, getFilePreviewById } from '$lib/apis/files';
 
 	import CodeBlock from '$lib/components/chat/Messages/CodeBlock.svelte';
 	import Markdown from '$lib/components/chat/Messages/Markdown.svelte';
@@ -43,6 +43,7 @@
 	let isExcel = false;
 	let isDocx = false;
 	let isPptx = false;
+	let isOfficePdfCandidate = false;
 
 	let selectedTab = '';
 	let excelWorkbook: WorkBook | null = null;
@@ -51,6 +52,9 @@
 	let excelHtml = '';
 	let excelError = '';
 	let rowCount = 0;
+
+	// Server-rendered Office PDF state
+	let officePdfData: ArrayBuffer | null = null;
 
 	// DOCX state
 	let docxData: ArrayBuffer | null = null;
@@ -133,10 +137,29 @@
 			'application/vnd.openxmlformats-officedocument.wordprocessingml.document' ||
 		(item?.name && item.name.toLowerCase().endsWith('.docx'));
 
+	$: isOfficePdfCandidate =
+		isDocx ||
+		item?.meta?.content_type === 'application/vnd.ms-excel' ||
+		item?.meta?.content_type ===
+			'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' ||
+		(item?.name &&
+			(item.name.toLowerCase().endsWith('.xls') || item.name.toLowerCase().endsWith('.xlsx')));
+
 	$: isPptx =
 		item?.meta?.content_type ===
 			'application/vnd.openxmlformats-officedocument.presentationml.presentation' ||
 		(item?.name && item.name.toLowerCase().endsWith('.pptx'));
+
+	const loadOfficePdfPreview = async () => {
+		try {
+			officePdfData = await getFilePreviewById(localStorage.token, item.id);
+			return true;
+		} catch (error) {
+			console.info('Server-rendered Office preview unavailable; using browser fallback.', error);
+			officePdfData = null;
+			return false;
+		}
+	};
 
 	const loadExcelContent = async () => {
 		try {
@@ -200,7 +223,12 @@
 	const loadContent = async () => {
 		selectedTab = '';
 		expandedContent = false;
+		officePdfData = null;
 		docxData = null;
+		excelWorkbook = null;
+		excelSheetNames = [];
+		excelHtml = '';
+		excelError = '';
 		if (item?.type === 'collection') {
 			loading = true;
 
@@ -225,12 +253,18 @@
 				item.file = file || {};
 			}
 
-			// Load Excel content if it's an Excel file
-			if (isExcel) {
+			if (isOfficePdfCandidate) {
+				const previewAvailable = await loadOfficePdfPreview();
+				if (!previewAvailable) {
+					if (isDocx) {
+						await loadDocxContent();
+					} else if (isExcel) {
+						await loadExcelContent();
+					}
+				}
+			} else if (isExcel) {
+				// CSV stays on the browser-rendered table preview.
 				await loadExcelContent();
-			}
-			if (isDocx) {
-				await loadDocxContent();
 			}
 			if (isPptx) {
 				await loadPptxContent();
@@ -261,16 +295,20 @@
 				<div>
 					<div class=" font-normal text-lg dark:text-gray-100">
 						<a
-							href="#"
+							href={item.type === 'file'
+								? item?.url?.startsWith('http')
+									? item.url
+									: `${WEBUI_API_BASE_URL}/files/${item?.id ?? item?.tempId}/content?attachment=true`
+								: item.url}
 							class="hover:underline line-clamp-1"
 							on:click|preventDefault={() => {
 								if (item.type === 'file' || item.url) {
-									let fileId = item?.id ?? item?.tempId;
+									const fileId = item?.id ?? item?.tempId;
 									window.open(
 										item.type === 'file'
 											? item?.url?.startsWith('http')
 												? item.url
-												: `${WEBUI_API_BASE_URL}/files/${fileId}/content`
+												: `${WEBUI_API_BASE_URL}/files/${fileId}/content?attachment=true`
 											: item.url,
 										'_blank'
 									);
@@ -510,12 +548,14 @@
 							class="w-full border-0 rounded-lg mb-2"
 							controls
 							playsinline
-						/>
+						></audio>
 					{:else if isPDF}
 						<PDFViewer
 							url={`${WEBUI_API_BASE_URL}/files/${item.id}/content`}
 							className="w-full h-[70vh] border-0 rounded-lg"
 						/>
+					{:else if isOfficePdfCandidate && officePdfData}
+						<PDFViewer data={officePdfData} className="w-full h-[70vh] border-0 rounded-lg" />
 					{:else if isExcel}
 						{#if excelError}
 							<div class="text-red-500 text-sm p-4">
@@ -542,6 +582,8 @@
 
 							{#if excelHtml}
 								<div class="office-preview overflow-auto max-h-[60vh]">
+									<!-- excelHtml is sanitized with DOMPurify immediately before assignment. -->
+									<!-- eslint-disable-next-line svelte/no-at-html-tags -->
 									{@html excelHtml}
 								</div>
 							{:else}

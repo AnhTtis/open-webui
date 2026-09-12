@@ -411,7 +411,8 @@ def _response_text(response: Any) -> str:
     choices = response.get('choices') or []
     if choices:
         message = choices[0].get('message') or {}
-        return message.get('content') or message.get('reasoning_content') or ''
+        # A provider's private reasoning is not valid summary content.
+        return message.get('content') or ''
 
     parts = []
     for item in response.get('output') or []:

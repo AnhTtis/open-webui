@@ -2,7 +2,10 @@ import asyncio
 import errno
 import hashlib
 import logging
+import mimetypes
 import os
+import re
+import unicodedata
 import uuid
 from pathlib import Path
 from typing import Optional
@@ -20,7 +23,7 @@ from fastapi import (
     UploadFile,
     status,
 )
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from open_webui.config import BYPASS_ADMIN_ACCESS_CONTROL, STORAGE_LOCAL_CACHE, STORAGE_PROVIDER, UPLOAD_DIR
 from open_webui.constants import ERROR_MESSAGES
 from open_webui.events import EVENTS, publish_event
@@ -45,6 +48,15 @@ from open_webui.routers.retrieval import ProcessFileForm, process_file
 from open_webui.storage.provider import Storage
 from open_webui.utils.auth import get_admin_user, get_verified_user
 from open_webui.utils.misc import strict_match_mime_type
+from open_webui.utils.office_preview import (
+    OfficePreviewConversionError,
+    OfficePreviewDisabledError,
+    OfficePreviewTimeoutError,
+    OfficePreviewTooLargeError,
+    OfficePreviewTypeError,
+    OfficePreviewUnavailableError,
+    convert_office_document_to_pdf,
+)
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -94,9 +106,9 @@ def _is_text_file(file_path: str, chunk_size: int = 8192) -> bool:
         return False
 
 
-def _cleanup_local_cache(file_path: str) -> None:
+def _cleanup_local_cache(file_path: str | None) -> None:
     """Remove the local cached copy of a cloud-stored file after processing."""
-    if STORAGE_LOCAL_CACHE or STORAGE_PROVIDER == 'local':
+    if not file_path or STORAGE_LOCAL_CACHE or STORAGE_PROVIDER == 'local':
         return
     try:
         local_filename = os.path.basename(file_path)
@@ -115,6 +127,30 @@ def _matches_configured_mime_type(supported: list[str] | str, content_type: str)
     if not supported:
         return False
     return bool(strict_match_mime_type(supported, content_type))
+
+
+def _file_display_name(file: FileModel) -> str:
+    meta = file.meta if isinstance(file.meta, dict) else {}
+    name = meta.get('name') or file.filename or 'download'
+    return re.sub(r'[\x00-\x1f\x7f]', '', str(name)) or 'download'
+
+
+def _content_disposition(filename: str, disposition: str) -> str:
+    normalized = unicodedata.normalize('NFKD', filename)
+    fallback = normalized.encode('ascii', errors='ignore').decode('ascii')
+    fallback = re.sub(r'[\\/\"]+', '_', fallback).strip(' .') or 'download'
+    encoded = quote(filename, safe='')
+    return f'{disposition}; filename="{fallback}"; filename*=UTF-8\'\'{encoded}'
+
+
+def _file_media_type(file: FileModel, filename: str) -> str:
+    meta = file.meta if isinstance(file.meta, dict) else {}
+    declared = meta.get('content_type')
+    if isinstance(declared, str):
+        declared = declared.split(';', 1)[0].strip().lower()
+        if re.fullmatch(r'[a-z0-9!#$&^_.+-]+/[a-z0-9!#$&^_.+-]+', declared) and declared != 'application/octet-stream':
+            return declared
+    return mimetypes.guess_type(filename)[0] or 'application/octet-stream'
 
 
 def _media_supported_for_extraction(
@@ -801,23 +837,17 @@ async def get_file_content_by_id(
 
             # Check if the file already exists in the cache
             if file_path.is_file():
-                # Handle Unicode filenames
-                filename = file.meta.get('name', file.filename)
-                encoded_filename = quote(filename)  # RFC5987 encoding
-
-                content_type = file.meta.get('content_type')
-                filename = file.meta.get('name', file.filename)
-                encoded_filename = quote(filename)
-                headers = {}
+                filename = _file_display_name(file)
+                content_type = _file_media_type(file, filename)
+                headers = {'X-Content-Type-Options': 'nosniff'}
 
                 if attachment:
-                    headers['Content-Disposition'] = f"attachment; filename*=UTF-8''{encoded_filename}"
-                else:
-                    if content_type == 'application/pdf' or filename.lower().endswith('.pdf'):
-                        headers['Content-Disposition'] = f"inline; filename*=UTF-8''{encoded_filename}"
-                        content_type = 'application/pdf'
-                    elif content_type != 'text/plain':
-                        headers['Content-Disposition'] = f"attachment; filename*=UTF-8''{encoded_filename}"
+                    headers['Content-Disposition'] = _content_disposition(filename, 'attachment')
+                elif content_type == 'application/pdf' or filename.lower().endswith('.pdf'):
+                    headers['Content-Disposition'] = _content_disposition(filename, 'inline')
+                    content_type = 'application/pdf'
+                elif content_type != 'text/plain':
+                    headers['Content-Disposition'] = _content_disposition(filename, 'attachment')
 
                 return FileResponse(file_path, headers=headers, media_type=content_type)
 
@@ -840,6 +870,82 @@ async def get_file_content_by_id(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=ERROR_MESSAGES.NOT_FOUND,
         )
+
+
+@router.get('/{id}/preview')
+async def get_file_preview_by_id(
+    id: str, user=Depends(get_verified_user), db: AsyncSession = Depends(get_async_session)
+):
+    file = await Files.get_file_by_id(id, db=db)
+    if not file:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=ERROR_MESSAGES.NOT_FOUND,
+        )
+
+    if not (file.user_id == user.id or user.role == 'admin' or await has_access_to_file(id, 'read', user, db=db)):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=ERROR_MESSAGES.NOT_FOUND,
+        )
+
+    if not file.path:
+        raise HTTPException(
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            detail=ERROR_MESSAGES.DEFAULT('This file cannot be previewed as PDF'),
+        )
+
+    try:
+        local_path = Path(await asyncio.to_thread(Storage.get_file, file.path))
+        filename = _file_display_name(file)
+        content_type = _file_media_type(file, filename)
+        pdf = await convert_office_document_to_pdf(local_path, filename, content_type)
+        preview_filename = f'{Path(filename).stem}.pdf'
+        return Response(
+            content=pdf,
+            media_type='application/pdf',
+            headers={
+                'Content-Disposition': _content_disposition(preview_filename, 'inline'),
+                'Cache-Control': 'private, no-store',
+                'X-Content-Type-Options': 'nosniff',
+            },
+        )
+    except (OfficePreviewDisabledError, OfficePreviewUnavailableError) as e:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=ERROR_MESSAGES.DEFAULT(str(e)),
+        ) from e
+    except OfficePreviewTooLargeError as e:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=ERROR_MESSAGES.DEFAULT(str(e)),
+        ) from e
+    except OfficePreviewTypeError as e:
+        raise HTTPException(
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            detail=ERROR_MESSAGES.DEFAULT(str(e)),
+        ) from e
+    except OfficePreviewTimeoutError as e:
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail=ERROR_MESSAGES.DEFAULT(str(e)),
+        ) from e
+    except OfficePreviewConversionError as e:
+        log.warning('LibreOffice preview conversion failed for file %s: %s', id, e)
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=ERROR_MESSAGES.DEFAULT('The document could not be converted to PDF'),
+        ) from e
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.exception('Error generating office document preview for file %s', id)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=ERROR_MESSAGES.DEFAULT('Error generating document preview'),
+        ) from e
+    finally:
+        _cleanup_local_cache(file.path)
 
 
 @router.get('/{id}/content/html')
@@ -906,10 +1012,12 @@ async def get_file_content_by_id(
     if file.user_id == user.id or user.role == 'admin' or await has_access_to_file(id, 'read', user, db=db):
         file_path = file.path
 
-        # Handle Unicode filenames
-        filename = file.meta.get('name', file.filename)
-        encoded_filename = quote(filename)  # RFC5987 encoding
-        headers = {'Content-Disposition': f"attachment; filename*=UTF-8''{encoded_filename}"}
+        filename = _file_display_name(file)
+        content_type = _file_media_type(file, filename)
+        headers = {
+            'Content-Disposition': _content_disposition(filename, 'attachment'),
+            'X-Content-Type-Options': 'nosniff',
+        }
 
         if file_path:
             file_path = await asyncio.to_thread(Storage.get_file, file_path)
@@ -917,7 +1025,7 @@ async def get_file_content_by_id(
 
             # Check if the file already exists in the cache
             if file_path.is_file():
-                return FileResponse(file_path, headers=headers)
+                return FileResponse(file_path, headers=headers, media_type=content_type)
             else:
                 raise HTTPException(
                     status_code=status.HTTP_404_NOT_FOUND,

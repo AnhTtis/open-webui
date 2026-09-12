@@ -3230,7 +3230,7 @@ provides-extras = ["all", "mariadb", "postgres", "unstructured"]
 [package.metadata.requires-dev]
 dev = [
     { name = "pytest-asyncio", specifier = ">=1.0.0" },
-    { name = "ruff", specifier = ">=0.15.5" },
+    { name = "ruff", specifier = "==0.15.18" },
 ]
 
 [[package]]

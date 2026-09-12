@@ -34,7 +34,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Install formatter
-        run: pip install "ruff>=0.15.5"
+        run: pip install "ruff==0.15.18"
 
       - name: Verify formatting
         run: ruff format --check . --exclude .venv --exclude venv

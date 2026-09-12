@@ -8,6 +8,7 @@ The scheduler_worker_loop handles all time-based background work:
   - Automation execution (claim_due → execute)
   - Calendar event alerts (upcoming events → socket + webhook notifications)
   - One-shot chat timers
+  - Durable memory extraction and embedding jobs
 
 Environment:
     SCHEDULER_POLL_INTERVAL             – seconds between polls (default: 10)
@@ -254,6 +255,15 @@ async def scheduler_worker_loop(app) -> None:
                         asyncio.create_task(execute_automation(app, automation))
                 except Exception:
                     log.exception('Scheduler: automation error')
+
+            # ── Durable Memory Jobs ──
+            if await Config.get('memories.enable'):
+                try:
+                    from open_webui.utils.memory_jobs import claim_and_dispatch_memory_jobs
+
+                    await claim_and_dispatch_memory_jobs(app)
+                except Exception:
+                    log.exception('Scheduler: memory job error')
 
             # ── Calendar Alerts ──
             if await Config.get('calendar.enable'):
