@@ -1062,20 +1062,16 @@ async def delete_user_by_id(
         )
 
     if user.id != user_id:
-        result = await Auths.delete_auth_by_id(user_id, db=db)
+        from open_webui.services.account_lifecycle import delete_account_or_raise
 
-        if result:
-            await publish_event(
-                request,
-                EVENTS.USER_DELETED,
-                actor=user,
-                subject_id=user_id,
-            )
-            return True
-
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=ERROR_MESSAGES.DELETE_USER_ERROR,
+        return await delete_account_or_raise(
+            user_id,
+            request=request,
+            actor=user,
+            source='admin',
+            protect_primary_admin=True,
+            forbid_self_delete=True,
+            db=db,
         )
 
     # Prevent self-deletion

@@ -126,6 +126,8 @@ ADMIN_CONFIG_KEYS = {
     'ENABLE_CALENDAR': 'calendar.enable',
     'ENABLE_MEMORIES': 'memories.enable',
     'ENABLE_MEMORY_SYSTEM_CONTEXT': 'memories.system_context.enable',
+    'MEMORIES_MAX_ITEMS_PER_USER': 'memories.max_items_per_user',
+    'MEMORIES_MAX_CONTENT_BYTES_PER_USER': 'memories.max_content_bytes_per_user',
     'ENABLE_NOTES': 'notes.enable',
     'ENABLE_USER_WEBHOOKS': 'ui.enable_user_webhooks',
     'ENABLE_USER_STATUS': 'users.enable_status',

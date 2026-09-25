@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import time
 from typing import Literal
 
 from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile, status
-from fastapi.responses import Response
+from fastapi.responses import Response, StreamingResponse
 from open_webui.config import RAG_EMBEDDING_QUERY_PREFIX
 from open_webui.constants import ERROR_MESSAGES
 from open_webui.events import EVENTS, publish_event
@@ -17,19 +19,33 @@ from open_webui.models.memories import (
     MemoryConflictError,
     MemoryModel,
     MemoryProposalModel,
+    MemoryQuotaExceeded,
+    MemoryRequestTooLarge,
     MemoryRevisionModel,
+    memory_collection_name,
+    parse_memory_vector_doc_id,
 )
-from open_webui.models.users import Users
 from open_webui.retrieval.vector.async_client import ASYNC_VECTOR_DB_CLIENT
-from open_webui.utils.access_control import has_permission
+from open_webui.retrieval.vector.main import SearchResult
 from open_webui.utils.auth import get_admin_user, get_verified_user
 from open_webui.utils.memory import (
     clean_memory_content,
     clean_memory_path,
-    list_memory_path_groups,
+    memory_vector_text,
     read_memory_path_rows,
-    search_memory_rows,
+    user_can_use_memories,
     validate_memory_operations,
+)
+from open_webui.utils.memory_limits import (
+    MEMORY_JSON_IMPORT_MAX_BYTES,
+    MEMORY_MAX_QUERY_BYTES,
+    MEMORY_NDJSON_IMPORT_MAX_BYTES,
+    MEMORY_NDJSON_LINE_MAX_BYTES,
+    MEMORY_NDJSON_MAX_RECORDS,
+    MEMORY_VECTOR_OVERSAMPLE,
+    MEMORY_VECTOR_TOP_K,
+    clamp_page_size,
+    utf8_bytes,
 )
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -40,18 +56,34 @@ router = APIRouter()
 
 
 async def check_memories_permission(user):
-    config = await Config.get_many('memories.enable', 'user.permissions')
+    if await user_can_use_memories(user):
+        return
+    config = await Config.get_many('memories.enable')
     if not config.get('memories.enable'):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=ERROR_MESSAGES.NOT_FOUND,
         )
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
+    )
 
-    if user.role != 'admin' and not await has_permission(user.id, 'features.memories', config.get('user.permissions')):
+
+def _raise_memory_http(exc: Exception) -> None:
+    if isinstance(exc, MemoryQuotaExceeded):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=exc.as_dict()) from exc
+    if isinstance(exc, MemoryRequestTooLarge):
         raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
-        )
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail={'code': exc.code, 'message': str(exc)},
+        ) from exc
+    if isinstance(exc, MemoryConflictError):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={'code': getattr(exc, 'code', 'memory_conflict'), 'message': str(exc)},
+        ) from exc
+    raise exc
 
 
 ############################
@@ -64,12 +96,64 @@ async def check_memories_permission(user):
 @router.get('/', response_model=list[MemoryModel])
 async def get_memories(
     request: Request,
+    skip: int = 0,
+    limit: int | None = None,
+    cursor: str | None = None,
     user=Depends(get_verified_user),
-    db: AsyncSession = Depends(get_async_session),
 ):
     await check_memories_permission(user)
+    page, _total, _next = await Memories.list_memories_page(
+        user.id,
+        skip=skip,
+        limit=limit,
+        cursor=cursor,
+    )
+    return page
 
-    return await Memories.get_memories_by_user_id(user.id, db=db)
+
+@router.get('/page')
+async def get_memories_page(
+    skip: int = 0,
+    limit: int | None = None,
+    cursor: str | None = None,
+    status: str | None = 'active',
+    memory_type: str | None = 'all',
+    query: str | None = None,
+    path: str | None = None,
+    user=Depends(get_verified_user),
+):
+    await check_memories_permission(user)
+    page_size = clamp_page_size(limit)
+    items, total, next_cursor = await Memories.list_memories_page(
+        user.id,
+        skip=skip,
+        limit=page_size,
+        cursor=cursor,
+        status=status,
+        memory_type=memory_type,
+        query=query,
+        path=path,
+        include_archived=status in {'archived', 'all'},
+        include_deleted=status in {'deleted', 'all'},
+    )
+    return {
+        'items': items,
+        'total': total,
+        'next_cursor': next_cursor,
+        'skip': skip,
+        'limit': page_size,
+    }
+
+
+@router.get('/summary')
+async def get_memory_summary(user=Depends(get_verified_user)):
+    await check_memories_permission(user)
+    return await Memories.get_user_summary(user.id)
+
+
+@router.get('/admin/health')
+async def get_memory_admin_health(user=Depends(get_admin_user)):
+    return await Memories.get_admin_health()
 
 
 ############################
@@ -141,21 +225,11 @@ async def reindex_memory_vectors_for_user(
     memories: list[MemoryModel] | None = None,
     user=None,
 ) -> int:
-    """Queue idempotent rebuild jobs without deleting the live collection."""
-    memories = memories if memories is not None else await Memories.get_memories_by_user_id(user_id)
-    queued = 0
-    for memory in memories or []:
-        if memory.status not in {'active', 'candidate'}:
-            continue
-        await Memories.enqueue_job(
-            user_id=user_id,
-            memory_id=memory.id,
-            job_type='upsert_embedding',
-            idempotency_key=f'memory:{memory.id}:revision:{memory.current_revision}:reindex',
-            payload={'revision': memory.current_revision, 'reindex': True},
-        )
-        queued += 1
-    return queued
+    """Queue a generation-fenced rebuild without loading the whole user set into RAM."""
+    from open_webui.utils.memory_jobs import embedding_fingerprint
+
+    result = await Memories.start_reindex_generation(user_id, fingerprint=embedding_fingerprint(request.app))
+    return int(result.get('queued') or 0)
 
 
 @router.post('/add', response_model=MemoryModel | None)
@@ -174,13 +248,16 @@ async def add_memory(
 
     content = clean_memory_content(form_data.content)
     path = clean_memory_path(form_data.path)
-    memory = await Memories.insert_new_memory(
-        user.id,
-        content,
-        memory_type=form_data.type,
-        path=path,
-        meta={'created_by': 'manual'},
-    )
+    try:
+        memory = await Memories.insert_new_memory(
+            user.id,
+            content,
+            memory_type=form_data.type,
+            path=path,
+            meta={'created_by': 'manual'},
+        )
+    except (MemoryQuotaExceeded, MemoryRequestTooLarge, MemoryConflictError) as exc:
+        _raise_memory_http(exc)
 
     await publish_event(
         request,
@@ -214,10 +291,10 @@ async def update_memories(
 
     try:
         results = await Memories.apply_memory_operations(user.id, operations)
-    except MemoryConflictError as e:
-        raise HTTPException(status_code=409, detail=str(e))
+    except (MemoryQuotaExceeded, MemoryRequestTooLarge, MemoryConflictError) as e:
+        _raise_memory_http(e)
     except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
+        raise HTTPException(status_code=404, detail=str(e)) from e
 
     response = []
     for result in results:
@@ -272,56 +349,109 @@ async def query_memory(
     user=Depends(get_verified_user),
 ):
     # NOTE: We intentionally do NOT use Depends(get_async_session) here.
-    # Database operations (get_memories_by_user_id) manage their own short-lived sessions.
     # This prevents holding a connection during EMBEDDING_FUNCTION()
     # which makes external embedding API calls (1-5+ seconds).
     await check_memories_permission(user)
 
-    memories = await Memories.get_memories_by_user_id(user.id)
-    if not memories:
-        raise HTTPException(status_code=404, detail='No memories found for user')
-
-    vector = await request.app.state.EMBEDDING_FUNCTION(form_data.content, prefix=RAG_EMBEDDING_QUERY_PREFIX, user=user)
-
-    results = await ASYNC_VECTOR_DB_CLIENT.search(
-        collection_name=f'user-memory-{user.id}',
-        vectors=[vector],
-        limit=max(1, min(form_data.k, 20)),
-    )
-
-    # Filter results by relevance threshold to avoid returning unrelated
-    # memories.  Vector similarity search always returns the top-K nearest
-    # neighbours even when they are completely irrelevant; applying the
-    # same RELEVANCE_THRESHOLD used by RAG ensures only genuinely matching
-    # memories are surfaced (distances are normalised to 0→1, higher is
-    # better).
-    relevance_threshold = max(0.0, min(float(await Config.get('memories.relevance_threshold', 0.2)), 1.0))
-    if results and relevance_threshold > 0.0 and results.distances and results.distances[0]:
-        from open_webui.retrieval.vector.main import SearchResult
-
-        filtered_ids = []
-        filtered_docs = []
-        filtered_metas = []
-        filtered_dists = []
-
-        for idx, score in enumerate(results.distances[0]):
-            if score >= relevance_threshold:
-                if results.ids and results.ids[0]:
-                    filtered_ids.append(results.ids[0][idx])
-                if results.documents and results.documents[0]:
-                    filtered_docs.append(results.documents[0][idx])
-                if results.metadatas and results.metadatas[0]:
-                    filtered_metas.append(results.metadatas[0][idx])
-                filtered_dists.append(score)
-
-        results = SearchResult(
-            ids=[filtered_ids] if filtered_ids else [[]],
-            documents=[filtered_docs] if filtered_docs else [[]],
-            metadatas=[filtered_metas] if filtered_metas else [[]],
-            distances=[filtered_dists] if filtered_dists else [[]],
+    if utf8_bytes(form_data.content) > MEMORY_MAX_QUERY_BYTES:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail={'code': 'memory_request_too_large', 'message': 'Query is too large'},
         )
 
-    return results
+    if not await Memories.user_has_memories(user.id):
+        raise HTTPException(status_code=404, detail='No memories found for user')
+
+    generation = await Memories.get_active_generation(user.id)
+    collection_name = generation.collection_name if generation else memory_collection_name(user.id)
+    top_k = max(1, min(int(form_data.k or MEMORY_VECTOR_TOP_K), MEMORY_VECTOR_TOP_K))
+    oversample = max(top_k, min(MEMORY_VECTOR_OVERSAMPLE, MEMORY_VECTOR_OVERSAMPLE))
+
+    vector = await request.app.state.EMBEDDING_FUNCTION(form_data.content, prefix=RAG_EMBEDDING_QUERY_PREFIX, user=user)
+    results = await ASYNC_VECTOR_DB_CLIENT.search(
+        collection_name=collection_name,
+        vectors=[vector],
+        limit=oversample,
+    )
+
+    relevance_threshold = max(0.0, min(float(await Config.get('memories.relevance_threshold', 0.2)), 1.0))
+    raw_ids = (results.ids[0] if results and results.ids else []) or []
+    raw_dists = (results.distances[0] if results and results.distances else []) or []
+
+    ranked: list[tuple[str, float | None]] = []
+    for idx, raw_id in enumerate(raw_ids):
+        score = raw_dists[idx] if idx < len(raw_dists) else None
+        if relevance_threshold > 0.0 and score is not None and score < relevance_threshold:
+            continue
+        ranked.append((str(raw_id), score))
+
+    parsed_ids = []
+    parsed_hits = []
+    for raw_id, score in ranked:
+        generation_id, memory_id, revision = parse_memory_vector_doc_id(raw_id)
+        parsed_hits.append((raw_id, generation_id, memory_id, revision, score))
+        if memory_id:
+            parsed_ids.append(memory_id)
+
+    canonical = await Memories.get_memories_by_ids(user.id, parsed_ids, eligible_only=True)
+    by_id = {memory.id: memory for memory in canonical}
+
+    filtered_ids: list[str] = []
+    filtered_docs: list[str] = []
+    filtered_metas: list[dict] = []
+    filtered_dists: list[float] = []
+    rejected: list[tuple[str, str | None, int | None]] = []
+
+    for raw_id, generation_id, memory_id, revision, score in parsed_hits:
+        memory = by_id.get(memory_id) if memory_id else None
+        if not memory or memory.status != 'active':
+            rejected.append((raw_id, memory_id, revision))
+            continue
+        if revision is not None and revision != memory.current_revision:
+            rejected.append((raw_id, memory_id, revision))
+            continue
+        filtered_ids.append(raw_id)
+        filtered_docs.append(memory_vector_text(memory.content, memory.path))
+        filtered_metas.append(
+            {
+                'created_at': memory.created_at,
+                'updated_at': memory.updated_at,
+                'type': memory.type,
+                'path': memory.path,
+                'status': memory.status,
+                'version': memory.version,
+                'revision': memory.current_revision,
+                'generation': generation_id,
+                'user_id': user.id,
+            }
+        )
+        filtered_dists.append(float(score) if score is not None else 0.0)
+        if len(filtered_ids) >= top_k:
+            break
+
+    for raw_id, memory_id, revision in rejected[:8]:
+        try:
+            await Memories.enqueue_job(
+                user_id=user.id,
+                memory_id=memory_id,
+                job_type='delete_embedding' if not memory_id or memory_id not in by_id else 'upsert_embedding',
+                idempotency_key=f'repair:{user.id}:{raw_id}'[:190],
+                payload={
+                    'vector_doc_id': raw_id,
+                    'collection_name': collection_name,
+                    'revision': revision,
+                    'repair': True,
+                },
+            )
+        except Exception:
+            log.debug('Failed to enqueue memory repair for %s', raw_id)
+
+    return SearchResult(
+        ids=[filtered_ids],
+        documents=[filtered_docs],
+        metadatas=[filtered_metas],
+        distances=[filtered_dists],
+    )
 
 
 @router.post('/search', response_model=list[MemoryModel])
@@ -330,31 +460,15 @@ async def search_memories(
     user=Depends(get_verified_user),
 ):
     await check_memories_permission(user)
-
-    if form_data.path or form_data.memory_id:
-        memories = await Memories.get_memories_by_user_id(
-            user.id,
-            include_archived=form_data.status in {'archived', 'all'},
-            include_deleted=form_data.status in {'deleted', 'all'},
-        )
-        if form_data.status != 'all':
-            memories = [memory for memory in memories if memory.status == form_data.status]
-        return search_memory_rows(
-            memories,
-            query=form_data.query,
-            path=form_data.path,
-            memory_id=form_data.memory_id,
-            memory_type=form_data.type,
-            limit=form_data.limit,
-        )
-
-    memories, _ = await Memories.search_memories(
+    memories, _total = await Memories.search_memories(
         user.id,
         query=form_data.query,
         memory_type=form_data.type,
         status=form_data.status,
         skip=form_data.skip,
         limit=form_data.limit,
+        path=form_data.path,
+        memory_id=form_data.memory_id,
     )
     return memories
 
@@ -365,10 +479,8 @@ async def list_memory_paths(
     user=Depends(get_verified_user),
 ):
     await check_memories_permission(user)
-
-    memories = await Memories.get_memories_by_user_id(user.id)
-    return list_memory_path_groups(
-        memories,
+    return await Memories.list_path_groups(
+        user.id,
         query=form_data.query or '',
         memory_type=form_data.type,
         limit=form_data.limit,
@@ -381,18 +493,28 @@ async def read_memory_path(
     user=Depends(get_verified_user),
 ):
     await check_memories_permission(user)
-
-    memories = await Memories.get_memories_by_user_id(user.id)
+    lookup_path = clean_memory_path(form_data.path)
+    if not lookup_path:
+        raise HTTPException(status_code=400, detail='Memory path is required')
+    page, _total, _next = await Memories.list_memories_page(
+        user.id,
+        path=lookup_path,
+        memory_type=form_data.type,
+        limit=form_data.limit,
+        status='active',
+    )
     result = read_memory_path_rows(
-        memories,
-        path=form_data.path,
+        page,
+        path=lookup_path,
         memory_type=form_data.type,
         include_children=form_data.include_children,
         limit=form_data.limit,
     )
+    parts = lookup_path.split('/')
+    result['parents'] = ['/'.join(parts[:idx]) for idx in range(1, len(parts))]
     return {
         **result,
-        'memories': [memory.model_dump() for memory in result['memories']],
+        'memories': [memory.model_dump() if hasattr(memory, 'model_dump') else memory for memory in result['memories']],
     }
 
 
@@ -404,23 +526,17 @@ async def reindex_memories_from_vector_db(
     request: Request,
     user=Depends(get_admin_user),
 ):
-    memories = await Memories.get_memories()
-    memories = memories or []
-    memories_by_user_id = {}
-    for memory in memories:
-        memories_by_user_id.setdefault(memory.user_id, []).append(memory)
-
-    users_result = await Users.get_users()
-    users = users_result.get('users', []) if users_result else []
+    after_user_id = None
+    total_users = 0
     total_memories = 0
-
-    for memory_user in users:
-        total_memories += await reindex_memory_vectors_for_user(
-            request,
-            memory_user.id,
-            memories=memories_by_user_id.get(memory_user.id, []),
-            user=memory_user,
-        )
+    while True:
+        user_ids = await Memories.iter_users_with_memories(after_user_id=after_user_id, limit=100)
+        if not user_ids:
+            break
+        for user_id in user_ids:
+            total_memories += await reindex_memory_vectors_for_user(request, user_id)
+            total_users += 1
+        after_user_id = user_ids[-1]
 
     await publish_event(
         request,
@@ -428,9 +544,14 @@ async def reindex_memories_from_vector_db(
         actor=user,
         subject_id='all',
         subject_type='user',
-        data={'count': total_memories, 'user_count': len(users), 'reindex': True},
+        data={'count': total_memories, 'user_count': total_users, 'reindex': True},
     )
-    return {'status': True, 'total_users': len(users), 'total_memories': total_memories}
+    return {
+        'status': True,
+        'total_users': total_users,
+        'total_memories': total_memories,
+        'operation': 'queued',
+    }
 
 
 @router.post('/reset', response_model=bool)
@@ -484,11 +605,26 @@ async def delete_memory_by_user_id(
 
 @router.get('/proposals', response_model=list[MemoryProposalModel])
 async def get_memory_proposals(
-    proposal_status: Literal['pending', 'approved', 'rejected', 'all'] = 'pending',
+    proposal_status: Literal['pending', 'approved', 'rejected', 'conflicted', 'all'] = 'pending',
+    skip: int = 0,
+    limit: int | None = None,
     user=Depends(get_verified_user),
 ):
     await check_memories_permission(user)
-    return await Memories.get_proposals(user.id, status=proposal_status)
+    return await Memories.get_proposals(user.id, status=proposal_status, skip=skip, limit=limit)
+
+
+@router.get('/proposals/page')
+async def get_memory_proposals_page(
+    proposal_status: Literal['pending', 'approved', 'rejected', 'conflicted', 'all'] = 'pending',
+    skip: int = 0,
+    limit: int | None = None,
+    user=Depends(get_verified_user),
+):
+    await check_memories_permission(user)
+    page_size = clamp_page_size(limit)
+    items, total = await Memories.get_proposals_page(user.id, status=proposal_status, skip=skip, limit=page_size)
+    return {'items': items, 'total': total, 'skip': skip, 'limit': page_size}
 
 
 @router.post('/proposals/{proposal_id}/review')
@@ -500,10 +636,10 @@ async def review_memory_proposal(
     await check_memories_permission(user)
     try:
         proposal, results = await Memories.review_proposal(proposal_id, user.id, form_data.approve)
-    except MemoryConflictError as exc:
-        raise HTTPException(status_code=409, detail=str(exc))
+    except (MemoryQuotaExceeded, MemoryRequestTooLarge, MemoryConflictError) as exc:
+        _raise_memory_http(exc)
     except ValueError as exc:
-        raise HTTPException(status_code=404, detail=str(exc))
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
     if not proposal:
         raise HTTPException(status_code=404, detail=ERROR_MESSAGES.NOT_FOUND)
     return {
@@ -535,6 +671,63 @@ async def export_memories(user=Depends(get_verified_user)):
     )
 
 
+@router.get('/export/ndjson')
+async def export_memories_ndjson(user=Depends(get_verified_user)):
+    await check_memories_permission(user)
+    user_id = user.id
+
+    async def generate():
+        hasher = hashlib.sha256()
+        count = 0
+
+        def emit(obj: dict) -> str:
+            line = json.dumps(obj, ensure_ascii=False, separators=(',', ':'))
+            hasher.update(line.encode('utf-8'))
+            hasher.update(b'\n')
+            return line + '\n'
+
+        yield emit(
+            {
+                'type': 'manifest',
+                'schema_version': 2,
+                'format': 'ndjson',
+                'exported_at': int(time.time()),
+            }
+        )
+        async for batch in Memories.iter_user_memory_batches(user_id):
+            for memory in batch:
+                count += 1
+                yield emit(
+                    {
+                        'type': 'memory',
+                        'id': memory.id,
+                        'content': memory.content,
+                        'type_name': memory.type,
+                        'path': memory.path,
+                        'status': memory.status,
+                        'scope': memory.scope,
+                        'kind': memory.kind,
+                        'structured_value': memory.structured_value,
+                        'current_revision': memory.current_revision,
+                        'version': memory.version,
+                        'updated_at': memory.updated_at,
+                        'created_at': memory.created_at,
+                    }
+                )
+        footer = {'type': 'footer', 'schema_version': 2, 'count': count, 'sha256': hasher.hexdigest()}
+        yield json.dumps(footer, ensure_ascii=False, separators=(',', ':')) + '\n'
+
+    return StreamingResponse(
+        generate(),
+        media_type='application/x-ndjson',
+        headers={
+            'Content-Disposition': 'attachment; filename="open-webui-memory-export.ndjson"',
+            'Cache-Control': 'no-store',
+            'X-Content-Type-Options': 'nosniff',
+        },
+    )
+
+
 @router.post('/import')
 async def import_memories(
     file: UploadFile = File(...),
@@ -542,21 +735,142 @@ async def import_memories(
     user=Depends(get_verified_user),
 ):
     await check_memories_permission(user)
-    max_bytes = 10 * 1024 * 1024
+    max_bytes = MEMORY_JSON_IMPORT_MAX_BYTES
     payload = await file.read(max_bytes + 1)
     if len(payload) > max_bytes:
         raise HTTPException(status_code=413, detail='Memory export is too large')
     try:
         bundle = json.loads(payload.decode('utf-8'))
         return await Memories.import_memory_bundle(user.id, bundle, dry_run=dry_run)
+    except (MemoryQuotaExceeded, MemoryRequestTooLarge, MemoryConflictError) as exc:
+        _raise_memory_http(exc)
     except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
-        raise HTTPException(status_code=422, detail=str(exc))
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.post('/import/ndjson')
+async def import_memories_ndjson(
+    file: UploadFile = File(...),
+    dry_run: bool = False,
+    user=Depends(get_verified_user),
+):
+    await check_memories_permission(user)
+    transfer = await Memories.create_transfer(user.id, direction='import', format='ndjson', dry_run=dry_run)
+    leftover = b''
+    total_bytes = 0
+    index = 0
+    batch: list[tuple[int, str, dict]] = []
+
+    async def flush_batch() -> None:
+        nonlocal batch
+        if batch:
+            await Memories.append_transfer_records(transfer.id, batch)
+            batch = []
+
+    try:
+        while True:
+            chunk = await file.read(64 * 1024)
+            if not chunk:
+                break
+            total_bytes += len(chunk)
+            if total_bytes > MEMORY_NDJSON_IMPORT_MAX_BYTES:
+                raise HTTPException(status_code=413, detail='NDJSON export is too large')
+            leftover += chunk
+            while b'\n' in leftover:
+                raw_line, leftover = leftover.split(b'\n', 1)
+                if not raw_line.strip():
+                    continue
+                if len(raw_line) > MEMORY_NDJSON_LINE_MAX_BYTES:
+                    raise HTTPException(status_code=413, detail='NDJSON line is too large')
+                try:
+                    record = json.loads(raw_line.decode('utf-8'))
+                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    raise HTTPException(status_code=422, detail=str(exc)) from exc
+                if not isinstance(record, dict):
+                    raise HTTPException(status_code=422, detail='NDJSON record must be an object')
+                record_type = str(record.get('type') or 'memory')
+                if record_type in {'manifest', 'footer'}:
+                    continue
+                if record_type == 'memory' and 'type_name' in record and 'type' not in record:
+                    record = {**record, 'type': record.get('type_name')}
+                batch.append((index, record_type, record))
+                index += 1
+                if index > MEMORY_NDJSON_MAX_RECORDS:
+                    raise HTTPException(status_code=413, detail='NDJSON record cap exceeded')
+                if len(batch) >= 100:
+                    await flush_batch()
+        if leftover.strip():
+            if len(leftover) > MEMORY_NDJSON_LINE_MAX_BYTES:
+                raise HTTPException(status_code=413, detail='NDJSON line is too large')
+            record = json.loads(leftover.decode('utf-8'))
+            if isinstance(record, dict) and str(record.get('type') or 'memory') not in {'manifest', 'footer'}:
+                if record.get('type') == 'memory' and 'type_name' in record:
+                    record = {**record, 'type': record.get('type_name')}
+                batch.append((index, str(record.get('type') or 'memory'), record))
+        await flush_batch()
+        return await Memories.publish_transfer(transfer.id, user.id)
+    except HTTPException:
+        raise
+    except (MemoryQuotaExceeded, MemoryRequestTooLarge, MemoryConflictError) as exc:
+        _raise_memory_http(exc)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.get('/operations/{operation_id}')
+async def get_memory_operation(operation_id: str, user=Depends(get_verified_user)):
+    await check_memories_permission(user)
+    transfer = await Memories.get_transfer(operation_id, user.id)
+    if not transfer:
+        raise HTTPException(status_code=404, detail=ERROR_MESSAGES.NOT_FOUND)
+    return {
+        'id': transfer.id,
+        'status': transfer.status,
+        'direction': transfer.direction,
+        'format': transfer.format,
+        'dry_run': transfer.dry_run,
+        'total_records': transfer.total_records,
+        'processed_records': transfer.processed_records,
+    }
+
+
+@router.get('/profile', response_model=AgentProfileModel)
+async def get_memory_profile(user=Depends(get_verified_user)):
+    await check_memories_permission(user)
+    return await Memories.get_or_create_profile(user.id)
+
+
+@router.post('/profile/learning', response_model=AgentProfileModel)
+async def set_memory_learning(
+    form_data: LearningStateForm,
+    user=Depends(get_verified_user),
+):
+    await check_memories_permission(user)
+    return await Memories.set_learning_paused(user.id, form_data.paused)
 
 
 @router.get('/{memory_id}/history', response_model=list[MemoryRevisionModel])
-async def get_memory_history(memory_id: str, user=Depends(get_verified_user)):
+async def get_memory_history(
+    memory_id: str,
+    skip: int = 0,
+    limit: int | None = None,
+    user=Depends(get_verified_user),
+):
     await check_memories_permission(user)
-    return await Memories.get_memory_revisions(memory_id, user.id)
+    return await Memories.get_memory_revisions(memory_id, user.id, skip=skip, limit=limit)
+
+
+@router.get('/{memory_id}/history/page')
+async def get_memory_history_page(
+    memory_id: str,
+    skip: int = 0,
+    limit: int | None = None,
+    user=Depends(get_verified_user),
+):
+    await check_memories_permission(user)
+    page_size = clamp_page_size(limit)
+    items, total = await Memories.get_memory_revisions_page(memory_id, user.id, skip=skip, limit=page_size)
+    return {'items': items, 'total': total, 'skip': skip, 'limit': page_size}
 
 
 @router.post('/{memory_id}/restore/{revision}', response_model=MemoryModel | None)
@@ -567,12 +881,15 @@ async def restore_memory_revision(
     user=Depends(get_verified_user),
 ):
     await check_memories_permission(user)
-    memory = await Memories.restore_memory_revision(
-        memory_id,
-        revision,
-        user.id,
-        meta={'created_by': 'manual', 'actor_id': user.id},
-    )
+    try:
+        memory = await Memories.restore_memory_revision(
+            memory_id,
+            revision,
+            user.id,
+            meta={'created_by': 'manual', 'actor_id': user.id},
+        )
+    except (MemoryQuotaExceeded, MemoryRequestTooLarge, MemoryConflictError) as exc:
+        _raise_memory_http(exc)
     if not memory:
         raise HTTPException(status_code=404, detail=ERROR_MESSAGES.NOT_FOUND)
 
@@ -589,21 +906,6 @@ async def restore_memory_revision(
         },
     )
     return memory
-
-
-@router.get('/profile', response_model=AgentProfileModel)
-async def get_memory_profile(user=Depends(get_verified_user)):
-    await check_memories_permission(user)
-    return await Memories.get_or_create_profile(user.id)
-
-
-@router.post('/profile/learning', response_model=AgentProfileModel)
-async def set_memory_learning(
-    form_data: LearningStateForm,
-    user=Depends(get_verified_user),
-):
-    await check_memories_permission(user)
-    return await Memories.set_learning_paused(user.id, form_data.paused)
 
 
 ############################
@@ -640,8 +942,8 @@ async def update_memory_by_id(
             meta={'created_by': 'manual'},
             expected_version=form_data.expected_version,
         )
-    except MemoryConflictError as exc:
-        raise HTTPException(status_code=409, detail=str(exc))
+    except (MemoryQuotaExceeded, MemoryRequestTooLarge, MemoryConflictError) as exc:
+        _raise_memory_http(exc)
     if memory is None:
         raise HTTPException(status_code=404, detail=ERROR_MESSAGES.NOT_FOUND)
 

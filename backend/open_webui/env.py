@@ -325,9 +325,15 @@ except (ValueError, TypeError):
 
 DATABASE_ENABLE_SQLITE_WAL = os.getenv('DATABASE_ENABLE_SQLITE_WAL', 'True').lower() == 'true'
 
-# SQLite PRAGMA tuning — these defaults are optimised for WAL-mode web-server
-# workloads.  Each can be overridden via its environment variable.
-# Set any value to an empty string to skip that PRAGMA entirely.
+# SQLite PRAGMA tuning — disk-first defaults keep the process working set
+# bounded. Canonical data stays on HDD/SSD; override these if the operator
+# explicitly wants a larger page cache. Set any value to an empty string to
+# skip that PRAGMA entirely. SQLite durable memory jobs support one app
+# process only; use PostgreSQL for multi-process/multi-node.
+
+# PRAGMA foreign_keys: must be enabled on every connection. SQLite defaults
+# this off, which would silently ignore ON DELETE CASCADE.
+DATABASE_SQLITE_PRAGMA_FOREIGN_KEYS = os.getenv('DATABASE_SQLITE_PRAGMA_FOREIGN_KEYS', 'ON')
 
 # PRAGMA synchronous: NORMAL (1) is safe with WAL and avoids an fsync per
 # transaction.  Valid values: OFF (0), NORMAL (1), FULL (2), EXTRA (3).
@@ -337,21 +343,30 @@ DATABASE_SQLITE_PRAGMA_SYNCHRONOUS = os.getenv('DATABASE_SQLITE_PRAGMA_SYNCHRONO
 # before raising SQLITE_BUSY.
 DATABASE_SQLITE_PRAGMA_BUSY_TIMEOUT = os.getenv('DATABASE_SQLITE_PRAGMA_BUSY_TIMEOUT', '5000')
 
-# PRAGMA cache_size: negative value = KiB.  -65536 ≈ 64 MB page cache.
-DATABASE_SQLITE_PRAGMA_CACHE_SIZE = os.getenv('DATABASE_SQLITE_PRAGMA_CACHE_SIZE', '-65536')
+# PRAGMA cache_size: negative value = KiB.  -8192 ≈ 8 MB page cache.
+# Previous default -65536 (64 MB) plus mmap could pin hundreds of MB in RAM.
+DATABASE_SQLITE_PRAGMA_CACHE_SIZE = os.getenv('DATABASE_SQLITE_PRAGMA_CACHE_SIZE', '-8192')
 
-# PRAGMA temp_store: MEMORY (2) keeps temp tables and indices in RAM.
+# PRAGMA temp_store: FILE (1) keeps temp tables and indices on disk.
 # Valid values: DEFAULT (0), FILE (1), MEMORY (2).
-DATABASE_SQLITE_PRAGMA_TEMP_STORE = os.getenv('DATABASE_SQLITE_PRAGMA_TEMP_STORE', 'MEMORY')
+DATABASE_SQLITE_PRAGMA_TEMP_STORE = os.getenv('DATABASE_SQLITE_PRAGMA_TEMP_STORE', 'FILE')
 
-# PRAGMA mmap_size (bytes): memory-mapped I/O size.  268435456 ≈ 256 MB.
-# Set to 0 to disable mmap.
-DATABASE_SQLITE_PRAGMA_MMAP_SIZE = os.getenv('DATABASE_SQLITE_PRAGMA_MMAP_SIZE', '268435456')
+# PRAGMA mmap_size (bytes): memory-mapped I/O size. Default 0 disables mmap
+# so SQLite does not pin a large file region in RAM. Set explicitly to enable.
+DATABASE_SQLITE_PRAGMA_MMAP_SIZE = os.getenv('DATABASE_SQLITE_PRAGMA_MMAP_SIZE', '0')
 
 # PRAGMA journal_size_limit (bytes): caps the WAL file size after checkpoint.
 # Without this the WAL grows unbounded during write bursts and is never
 # truncated.  67108864 ≈ 64 MB.  Set to -1 for no limit (SQLite default).
 DATABASE_SQLITE_PRAGMA_JOURNAL_SIZE_LIMIT = os.getenv('DATABASE_SQLITE_PRAGMA_JOURNAL_SIZE_LIMIT', '67108864')
+
+# Async SQLite pool fallback when DATABASE_POOL_SIZE is unset. Previous
+# fallback of 512 connections could reserve a large RAM ceiling.
+_sqlite_async_pool_raw = os.getenv('DATABASE_SQLITE_ASYNC_POOL_SIZE', '32')
+try:
+    DATABASE_SQLITE_ASYNC_POOL_SIZE = max(1, min(int(_sqlite_async_pool_raw), 128))
+except (ValueError, TypeError):
+    DATABASE_SQLITE_ASYNC_POOL_SIZE = 32
 
 # Seconds between presence writes per user per worker; keep under the 180s active-user window. 0 disables.
 try:

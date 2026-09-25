@@ -10,32 +10,35 @@
 	import Dropdown from '$lib/components/common/Dropdown.svelte';
 	import DropdownMenu from '$lib/components/common/DropdownMenu.svelte';
 	import ExperimentalBadge from '$lib/components/common/ExperimentalBadge.svelte';
-	import MemoryModal from './Personalization/MemoryModal.svelte';
+	import Pagination from '$lib/components/common/Pagination.svelte';
+		import MemoryModal from './Personalization/MemoryModal.svelte';
 	import {
 		deleteMemoriesByUserId,
 		deleteMemoryById,
 		exportMemories,
 		getMemoryHistory,
-		importMemories,
+		importMemoryFile,
 		getMemoryProfile,
 		getMemoryProposals,
+			getMemorySummary,
+			MemoryApiError,
+			saveNdjsonExport,
 		restoreMemoryRevision,
 		reviewMemoryProposal,
-		searchMemories,
+		getMemoriesPage,
 		setMemoryLearningPaused,
 		syncMemories,
 		type MemoryImportResult,
 		type MemoryItem,
 		type MemoryProfile,
 		type MemoryProposal,
-		type MemoryRevision
+		type MemoryRevision,
+			type MemorySummary
 	} from '$lib/apis/memories';
 	import { toast } from 'svelte-sonner';
 	import UserSettingRow from './UserSettingRow.svelte';
 	import UserSettingSection from './UserSettingSection.svelte';
 	import ChevronDown from '$lib/components/icons/ChevronDown.svelte';
-	import ChevronLeft from '$lib/components/icons/ChevronLeft.svelte';
-	import ChevronRight from '$lib/components/icons/ChevronRight.svelte';
 	import Plus from '$lib/components/icons/Plus.svelte';
 	import Refresh from '$lib/components/icons/Refresh.svelte';
 	import Search from '$lib/components/icons/Search.svelte';
@@ -50,6 +53,9 @@
 	let enableMemory = false;
 	let memories: MemoryItem[] = [];
 	let memoryProfile: MemoryProfile | null = null;
+		let memorySummary: MemorySummary | null = null;
+		let memoryTotal = 0;
+		let operationLabel = '';
 	let proposals: MemoryProposal[] = [];
 	let history: MemoryRevision[] = [];
 	let loadingMemories = true;
@@ -75,10 +81,9 @@
 	let submittedQuery = '';
 	let memoryType: 'all' | 'user' | 'context' = 'all';
 	let memoryStatus: 'active' | 'candidate' | 'archived' | 'deleted' | 'all' = 'active';
-	let page = 0;
+	let page = 1;
 	const pageSize = 10;
-	let hasNextPage = false;
-	let searchTimer: ReturnType<typeof setTimeout>;
+		let searchTimer: ReturnType<typeof setTimeout>;
 	let searchInitialized = false;
 
 	const actionButtonClass =
@@ -86,27 +91,45 @@
 	const filterClass =
 		'h-7 rounded-lg border border-gray-100/50 bg-gray-50/40 px-2 text-xs text-gray-700 outline-hidden dark:border-white/[0.04] dark:bg-white/[0.03] dark:text-gray-300';
 
+		const toastMemoryError = (error: unknown) => {
+			if (error instanceof MemoryApiError) {
+				if (error.code === 'memory_quota_exceeded') {
+					toast.error($i18n.t('Memory quota exceeded'));
+					return;
+				}
+				if (error.status === 413) {
+					toast.error($i18n.t('Memory request is too large'));
+					return;
+				}
+				if (error.status === 409) {
+					toast.error($i18n.t('This memory was changed. Refresh and try again.'));
+					return;
+				}
+				toast.error(error.message);
+				return;
+			}
+			toast.error(`${error}`);
+		};
+
 	const loadMemories = async () => {
 		loadingMemories = true;
-		const results = await searchMemories(localStorage.token, {
+		const result = await getMemoriesPage(localStorage.token, {
 			query: submittedQuery,
 			type: memoryType,
 			status: memoryStatus,
-			skip: page * pageSize,
-			limit: pageSize + 1
+			skip: (page - 1) * pageSize,
+			limit: pageSize
 		}).catch((error) => {
-			toast.error(`${error}`);
-			return [];
+			toastMemoryError(error);
+			return { items: [], total: 0 };
 		});
 
-		hasNextPage = results.length > pageSize;
-		memories = results.slice(0, pageSize);
-		if (page > 0 && memories.length === 0) {
-			page -= 1;
-			loadingMemories = false;
-			await loadMemories();
-			return;
-		}
+		memoryTotal = result.total ?? 0;
+		memories = result.items ?? [];
+			memorySummary = await getMemorySummary(localStorage.token).catch((error) => {
+				toastMemoryError(error);
+				return null;
+			});
 		loadingMemories = false;
 	};
 
@@ -114,11 +137,11 @@
 		loadingProposals = true;
 		const [profile, pendingProposals] = await Promise.all([
 			getMemoryProfile(localStorage.token).catch((error) => {
-				toast.error(`${error}`);
+				toastMemoryError(error);
 				return null;
 			}),
 			getMemoryProposals(localStorage.token).catch((error) => {
-				toast.error(`${error}`);
+				toastMemoryError(error);
 				return [];
 			})
 		]);
@@ -148,7 +171,7 @@
 		loadingHistory = true;
 		history =
 			(await getMemoryHistory(localStorage.token, memory.id).catch((error) => {
-				toast.error(`${error}`);
+				toastMemoryError(error);
 				return [];
 			})) ?? [];
 		loadingHistory = false;
@@ -162,7 +185,7 @@
 			selectedMemory.id,
 			revision.revision
 		).catch((error) => {
-			toast.error(`${error}`);
+			toastMemoryError(error);
 			return null;
 		});
 		if (result) {
@@ -170,7 +193,7 @@
 			await loadMemories();
 			selectedMemory = result;
 			history = await getMemoryHistory(localStorage.token, result.id).catch((error) => {
-				toast.error(`${error}`);
+				toastMemoryError(error);
 				return [];
 			});
 		}
@@ -180,7 +203,7 @@
 	const restoreDeletedMemory = async (memory: MemoryItem) => {
 		restoringMemoryId = memory.id;
 		const revisions = await getMemoryHistory(localStorage.token, memory.id).catch((error) => {
-			toast.error(`${error}`);
+			toastMemoryError(error);
 			return [];
 		});
 		const source = revisions.find((revision) => revision.status !== 'deleted' && revision.content);
@@ -195,7 +218,7 @@
 			memory.id,
 			source.revision
 		).catch((error) => {
-			toast.error(`${error}`);
+			toastMemoryError(error);
 			return null;
 		});
 		if (restored) {
@@ -213,7 +236,7 @@
 		reviewingProposalId = proposal.id;
 		const result = await reviewMemoryProposal(localStorage.token, proposal.id, approve).catch(
 			(error) => {
-				toast.error(`${error}`);
+				toastMemoryError(error);
 				return null;
 			}
 		);
@@ -228,7 +251,7 @@
 	const setLearningPaused = async (paused: boolean) => {
 		changingLearning = true;
 		const profile = await setMemoryLearningPaused(localStorage.token, paused).catch((error) => {
-			toast.error(`${error}`);
+			toastMemoryError(error);
 			return null;
 		});
 		if (profile) {
@@ -244,8 +267,9 @@
 
 	const syncMemoryCenter = async () => {
 		syncing = true;
+			operationLabel = $i18n.t('Rebuilding memory index');
 		const result = await syncMemories(localStorage.token).catch((error) => {
-			toast.error(`${error}`);
+			toastMemoryError(error);
 			return false;
 		});
 		if (result) {
@@ -255,10 +279,21 @@
 		syncing = false;
 	};
 
-	const exportMemoryCenter = async () => {
+	const exportMemoryCenter = async (format: 'json' | 'ndjson' = 'json') => {
 		exportingMemories = true;
-		const blob = await exportMemories(localStorage.token).catch((error) => {
-			toast.error(`${error}`);
+		if (format === 'ndjson') {
+				try {
+					await saveNdjsonExport(localStorage.token);
+					toast.success($i18n.t('Memory export downloaded'));
+				} catch (error) {
+					toastMemoryError(error);
+				}
+				exportingMemories = false;
+				operationLabel = '';
+				return;
+			}
+			const blob = await exportMemories(localStorage.token).catch((error) => {
+			toastMemoryError(error);
 			return null;
 		});
 		if (blob) {
@@ -282,8 +317,8 @@
 		if (!file) return;
 
 		importingMemories = true;
-		const preview = await importMemories(localStorage.token, file, true).catch((error) => {
-			toast.error(`${error}`);
+		const preview = await importMemoryFile(localStorage.token, file, true).catch((error) => {
+			toastMemoryError(error);
 			return null;
 		});
 		importingMemories = false;
@@ -300,9 +335,10 @@
 
 	const confirmMemoryImport = async () => {
 		if (!pendingImportFile) return;
+			operationLabel = $i18n.t('Importing memories');
 		importingMemories = true;
-		const result = await importMemories(localStorage.token, pendingImportFile).catch((error) => {
-			toast.error(`${error}`);
+		const result = await importMemoryFile(localStorage.token, pendingImportFile).catch((error) => {
+			toastMemoryError(error);
 			return null;
 		});
 		if (result) {
@@ -310,9 +346,11 @@
 				$i18n.t('Imported {{imported}} memories; skipped {{skipped}} duplicates', {
 					imported: result.imported,
 					skipped: result.skipped
-				})
-			);
-			page = 0;
+					})
+				);
+				operationLabel = '';
+				
+			page = 1;
 			await loadMemories();
 		}
 		importingMemories = false;
@@ -328,14 +366,16 @@
 	};
 
 	const onClearConfirmed = async () => {
+			operationLabel = $i18n.t('Clearing memories');
 		const res = await deleteMemoriesByUserId(localStorage.token).catch((error) => {
-			toast.error(`${error}`);
+			toastMemoryError(error);
 			return null;
 		});
 
 		if (res) {
 			toast.success($i18n.t('Memory cleared successfully'));
-			page = 0;
+				operationLabel = '';
+			page = 1;
 			await loadMemories();
 		}
 		showClearConfirmDialog = false;
@@ -347,32 +387,24 @@
 	const formatTime = (timestamp?: number | null) =>
 		timestamp ? new Date(timestamp * 1000).toLocaleString() : '';
 
-	$: syncCounts = memories.reduce(
-		(counts, memory) => {
-			counts[memory.sync_status] = (counts[memory.sync_status] ?? 0) + 1;
-			return counts;
-		},
-		{} as Record<string, number>
-	);
-
-	$: searchKey = JSON.stringify([query, memoryType, memoryStatus]);
+	$: syncCounts = memorySummary?.sync_counts ?? {};
+		$: searchKey = JSON.stringify([query, memoryType, memoryStatus]);
 
 	$: if (searchInitialized && searchKey) {
 		clearTimeout(searchTimer);
-		searchTimer = setTimeout(async () => {
+		searchTimer = setTimeout(() => {
 			submittedQuery = query.trim();
-			page = 0;
-			await loadMemories();
+			page = 1;
 		}, 300);
 	}
 
-	$: if (searchInitialized && page >= 0) {
+	$: if (searchInitialized && page >= 1 && submittedQuery !== undefined) {
 		void loadMemories();
 	}
 
 	onMount(async () => {
 		enableMemory = $settings?.memory ?? $config?.features?.enable_memories ?? false;
-		await Promise.all([loadMemories(), loadMemoryCenter()]);
+		await loadMemoryCenter();
 		searchInitialized = true;
 	});
 </script>
@@ -515,6 +547,14 @@
 						<div class="mb-1 flex items-center justify-between gap-3">
 							<div class="text-xs font-medium text-gray-700 dark:text-gray-300">
 								{$i18n.t('Saved Memories')}
+									{#if memorySummary}
+										<span class="ml-1 text-gray-400 dark:text-gray-600">
+											{memorySummary.counted_items}/{memorySummary.max_items}
+										</span>
+									{/if}
+									{#if operationLabel}
+										<span class="ml-2 text-[0.6875rem] text-gray-400">{operationLabel}</span>
+									{/if}
 							</div>
 							<div class="flex items-center gap-2 text-[0.6875rem] text-gray-500">
 								{#if syncCounts.failed}
@@ -613,6 +653,14 @@
 											on:click={exportMemoryCenter}
 										>
 											<div class="truncate text-left">{$i18n.t('Export memories')}</div>
+											</button>
+											<button
+												class="flex h-[1.6875rem] w-full items-center gap-2 rounded-lg px-2 text-xs hover:text-gray-900 disabled:opacity-30 dark:hover:text-gray-100"
+												type="button"
+												disabled={exportingMemories}
+												on:click={() => exportMemoryCenter('ndjson')}
+											>
+												<div class="truncate text-left">{$i18n.t('Export NDJSON')}</div>
 										</button>
 										<button
 											class="flex h-[1.6875rem] w-full items-center gap-2 rounded-lg px-2 text-xs hover:text-gray-900 disabled:opacity-30 dark:hover:text-gray-100"
@@ -625,7 +673,7 @@
 										<input
 											class="hidden"
 											type="file"
-											accept="application/json,.json"
+											accept="application/json,.json,.ndjson,application/x-ndjson"
 											bind:this={memoryImportInput}
 											on:change={importMemoryCenter}
 										/>
@@ -768,30 +816,10 @@
 								{/each}
 							</div>
 
-							{#if page > 0 || hasNextPage}
-								<div class="mt-3 flex items-center justify-center gap-4">
-									<button
-										type="button"
-										class="rounded-lg p-1.5 hover:bg-gray-50 disabled:text-gray-300 dark:hover:bg-gray-850 dark:disabled:text-gray-700"
-										disabled={page === 0 || loadingMemories}
-										on:click={() => (page -= 1)}
-										aria-label={$i18n.t('Previous page')}
-									>
-										<ChevronLeft className="size-4" strokeWidth="2" />
-									</button>
-									<span class="text-xs text-gray-500">{$i18n.t('Page')} {page + 1}</span>
-									<button
-										type="button"
-										class="rounded-lg p-1.5 hover:bg-gray-50 disabled:text-gray-300 dark:hover:bg-gray-850 dark:disabled:text-gray-700"
-										disabled={!hasNextPage || loadingMemories}
-										on:click={() => (page += 1)}
-										aria-label={$i18n.t('Next page')}
-									>
-										<ChevronRight className="size-4" strokeWidth="2" />
-									</button>
-								</div>
-							{/if}
-						{/if}
+							{#if memoryTotal > pageSize}
+									<Pagination bind:page count={memoryTotal} perPage={pageSize} />
+								{/if}
+														{/if}
 					</div>
 				</div>
 			{/if}
@@ -861,7 +889,7 @@
 	on:confirm={async () => {
 		if (!selectedMemory) return;
 		const res = await deleteMemoryById(localStorage.token, selectedMemory.id).catch((error) => {
-			toast.error(`${error}`);
+			toastMemoryError(error);
 			return null;
 		});
 		if (res) {

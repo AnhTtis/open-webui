@@ -54,6 +54,7 @@
 	import AdminImages from '$lib/components/admin/Settings/Images.svelte';
 	import AdminPipelines from '$lib/components/admin/Settings/Pipelines.svelte';
 	import AdminDatabase from '$lib/components/admin/Settings/Database.svelte';
+		import AdminMemory from '$lib/components/admin/Settings/Memory.svelte';
 
 	const i18n: Writable<any> = getContext('i18n');
 
@@ -782,7 +783,12 @@
 		},
 
 		{
-			id: 'admin:db',
+			id: 'admin:memory',
+				title: 'Memory',
+				keywords: ['memory', 'memories', 'quota', 'health', 'ndjson', 'vector']
+			},
+			{
+				id: 'admin:db',
 			title: 'Database',
 			keywords: ['database', 'export', 'import', 'backup', 'chats', 'users']
 		}
@@ -1307,7 +1313,13 @@
 						toast.success($i18n.t('Settings saved successfully!'));
 					}}
 				/>
-			{:else if selectedTab === 'admin:db'}
+			{:else if selectedTab === 'admin:memory'}
+					<AdminMemory
+						saveHandler={() => {
+							toast.success($i18n.t('Settings saved successfully!'));
+						}}
+					/>
+				{:else if selectedTab === 'admin:db'}
 				<AdminDatabase
 					saveHandler={() => {
 						toast.success($i18n.t('Settings saved successfully!'));

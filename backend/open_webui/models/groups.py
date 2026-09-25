@@ -477,6 +477,19 @@ class GroupTable:
                 await db.rollback()
                 return False
 
+    async def remove_user_from_all_groups_tx(self, db: AsyncSession, user_id: str) -> None:
+        result = await db.execute(
+            select(Group)
+            .join(GroupMember, GroupMember.group_id == Group.id)
+            .filter(GroupMember.user_id == user_id)
+        )
+        groups = result.scalars().all()
+        for group in groups:
+            await db.execute(
+                delete(GroupMember).filter(GroupMember.group_id == group.id, GroupMember.user_id == user_id)
+            )
+            await db.execute(update(Group).filter_by(id=group.id).values(updated_at=int(time.time())))
+
     async def create_groups_by_group_names(
         self, user_id: str, group_names: list[str], db: Optional[AsyncSession] = None
     ) -> list[GroupModel]:

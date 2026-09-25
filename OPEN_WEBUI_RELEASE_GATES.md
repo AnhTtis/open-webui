@@ -1,16 +1,20 @@
 # Open WebUI release gates
 
-> Updated: 2026-09-11  
+> Updated: 2026-09-25  
 > Branch: `claude/native-memory-stability`  
-> Scope: production readiness after native-only source implementation
+> Scope: production readiness after native-only source implementation and memory hardening  
+> Changelog: [OPEN_WEBUI_NATIVE_MEMORY_CHANGELOG.md](./OPEN_WEBUI_NATIVE_MEMORY_CHANGELOG.md)
 
 The feature source and focused tests are substantially complete. The retired Harness directories are already removed. This document is the single canonical list of work that remains before production approval for more than 20 non-technical users and 3–4 years of memory retention.
 
 ## Current verified baseline
 
+The counts below are the **2026-09-11** native-pipeline checkpoint. They are not a 2026-09-25 hardening pass.
+
 - Embedded Hermes Harness is absent from the native runtime and retired directories are deleted.
-- Focused backend pytest: **43 tests passed, 333 subtests passed**.
-- Focused frontend Vitest: **2 files, 10 tests passed**.
+- Focused backend pytest (2026-09-11): **43 tests passed, 333 subtests passed**.
+- Focused frontend Vitest (2026-09-11): **2 files, 10 tests passed**.
+- 2026-09-25 hardening tests were written (`backend/tests/test_memory_hardening.py`, extended `src/lib/apis/memories/index.test.ts`) and **not executed** here (no pytest/aiosqlite/Node in this environment).
 - Focused ESLint passes for the changed files API, Memory Center and Office preview files.
 - IDE diagnostics are empty for those changed frontend files and `backend/tests/test_office_preview.py`.
 - Focused Prettier and `git diff --check` pass at the current checkpoint.
@@ -249,4 +253,21 @@ Any cleanup must continue to exclude `backend/data/**`, uploads, vector state, `
 - [ ] Final security review and `git diff --check` pass.
 - [ ] Complete deletion/source inventory is reviewed before commit.
 
-No commit or push has been requested or performed.
+## 15. Native memory hardening remaining gates
+
+Source hardening for quota, bounded reads, job fencing, account cleanup, NDJSON transfer and metadata-only admin health is in the working tree. The following remain **unrun** unless a later verification section records a pass:
+
+- clean and representative-legacy SQLite Alembic upgrade through `f8c2a91d4e73` and `a9d3b70e5c14`, including duplicate-preflight failure
+- PostgreSQL 16 partial-unique duplicate race, `SKIP LOCKED` disjoint claims, concurrent proposal approval, quota reservation, and account cascade with surviving cleanup
+- live pgvector or on-disk Qdrant generation switch during concurrent mutation
+- crash during vector upsert/import side effects and restart recovery
+- 20–50 user long-horizon load
+- backup/PITR restore drill
+- real SCIM provider deletion against the shared `delete_account` path
+- full frontend `npm run check` / Node 22 production build
+
+SQLite is single-process only for durable memory jobs. Multi-process workers require PostgreSQL.
+
+Account deletion covers auth, OAuth sessions, API keys, group membership, chats, canonical memory, and independent vector-cleanup intent. Other user-owned resources are not claimed erased.
+
+Branch commit `34791a339` already exists. Hardening after that commit is uncommitted. No further commit or push has been requested.

@@ -2505,23 +2505,24 @@ class ChatTable:
     async def delete_chats_by_user_id(self, user_id: str, db: AsyncSession | None = None) -> bool:
         try:
             async with get_async_db_context(db) as session:
-                await self.delete_shared_chats_by_user_id(user_id, db=session)
-
-                chat_id_subquery = select(Chat.id).filter_by(user_id=user_id).scalar_subquery()
-                await session.execute(
-                    update(AutomationRun)
-                    .filter(AutomationRun.chat_id.in_(select(Chat.id).filter_by(user_id=user_id)))
-                    .values(chat_id=None)
-                )
-                await session.execute(
-                    delete(ChatMessage).filter(ChatMessage.chat_id.in_(select(Chat.id).filter_by(user_id=user_id)))
-                )
-                await session.execute(delete(Chat).filter_by(user_id=user_id))
+                await self.delete_chats_by_user_id_tx(session, user_id)
                 await session.commit()
-
                 return True
         except Exception:
             return False
+
+    async def delete_chats_by_user_id_tx(self, db: AsyncSession, user_id: str) -> None:
+        from open_webui.models.shared_chats import SharedChat as SharedChatTable
+
+        await db.execute(delete(SharedChatTable).filter_by(user_id=user_id))
+        await db.execute(update(Chat).filter_by(user_id=user_id).values(share_id=None))
+        await db.execute(
+            update(AutomationRun)
+            .filter(AutomationRun.chat_id.in_(select(Chat.id).filter_by(user_id=user_id)))
+            .values(chat_id=None)
+        )
+        await db.execute(delete(ChatMessage).filter(ChatMessage.chat_id.in_(select(Chat.id).filter_by(user_id=user_id))))
+        await db.execute(delete(Chat).filter_by(user_id=user_id))
 
     async def delete_chats_by_user_id_and_folder_id(
         self, user_id: str, folder_id: str, db: AsyncSession | None = None

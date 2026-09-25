@@ -1068,7 +1068,6 @@ async def delete_memory(
         result = await Memories.delete_memory_by_id_and_user_id(memory_id, user.id)
 
         if result:
-            await ASYNC_VECTOR_DB_CLIENT.delete(collection_name=f'user-memory-{user.id}', ids=[memory_id])
             return JSONCodec.dumps(
                 {'status': 'success', 'message': f'Memory {memory_id} deleted'},
                 ensure_ascii=False,
@@ -1081,37 +1080,65 @@ async def delete_memory(
 
 
 async def list_memories(
+    skip: int = 0,
+    limit: int = 20,
+    cursor: Optional[str] = None,
     __request__: Request = None,
     __user__: dict = None,
 ) -> str:
     """
-    List all stored memories for the user, including IDs and timestamps.
+    List stored memories for the user, including IDs and timestamps.
 
-    :return: JSON list of all memories with id, content, and dates
+    :param skip: Offset for page-based listing
+    :param limit: Page size, default 20, maximum 50
+    :param cursor: Optional keyset cursor from a previous page
+    :return: JSON page of memories with id, content, dates, total and next_cursor
     """
     if __request__ is None:
         return JSONCodec.dumps({'error': 'Request context not available'})
 
     try:
+        from open_webui.utils.memory_limits import (
+            MEMORY_TOOL_LIST_DEFAULT,
+            MEMORY_TOOL_LIST_MAX,
+            MEMORY_TOOL_RESULT_MAX_BYTES,
+            utf8_bytes,
+        )
+
         user = UserModel(**__user__) if __user__ else None
-
-        memories = await Memories.get_memories_by_user_id(user.id)
-
-        if memories:
-            memory_rows = [
-                {
-                    'id': m.id,
-                    'type': m.type,
-                    'path': m.path,
-                    'content': m.content,
-                    'created_at': time.strftime('%Y-%m-%d %H:%M', time.localtime(m.created_at)),
-                    'updated_at': time.strftime('%Y-%m-%d %H:%M', time.localtime(m.updated_at)),
-                }
-                for m in memories
-            ]
-            return JSONCodec.dumps(memory_rows, ensure_ascii=False)
-        else:
-            return JSONCodec.dumps([])
+        page_size = max(1, min(int(limit or MEMORY_TOOL_LIST_DEFAULT), MEMORY_TOOL_LIST_MAX))
+        memories, total, next_cursor = await Memories.list_memories_page(
+            user.id,
+            skip=max(0, int(skip or 0)),
+            limit=page_size,
+            cursor=cursor,
+        )
+        memory_rows = []
+        used = 0
+        for memory in memories:
+            row = {
+                'id': memory.id,
+                'type': memory.type,
+                'path': memory.path,
+                'content': memory.content,
+                'created_at': time.strftime('%Y-%m-%d %H:%M', time.localtime(memory.created_at)),
+                'updated_at': time.strftime('%Y-%m-%d %H:%M', time.localtime(memory.updated_at)),
+            }
+            size = utf8_bytes(memory.content)
+            if memory_rows and used + size > MEMORY_TOOL_RESULT_MAX_BYTES:
+                break
+            memory_rows.append(row)
+            used += size
+        return JSONCodec.dumps(
+            {
+                'items': memory_rows,
+                'total': total,
+                'next_cursor': next_cursor,
+                'skip': max(0, int(skip or 0)),
+                'limit': page_size,
+            },
+            ensure_ascii=False,
+        )
     except Exception as e:
         log.exception(f'list_memories error: {e}')
         return JSONCodec.dumps({'error': str(e)})

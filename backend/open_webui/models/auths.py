@@ -231,12 +231,18 @@ class AuthsTable:
         db: AsyncSession | None = None,
     ) -> bool:
         """Remove a user and their auth credential in one transaction."""
-        async with get_async_db_context(db) as session:
-            if not await Users.delete_user_by_id(id, db=session):
-                return False
-            await session.execute(delete(Auth).where(Auth.id == id))
-            await session.commit()
-            return True
+        from open_webui.services.account_lifecycle import AccountDeleteError, delete_account
+
+        try:
+            return await delete_account(
+                id,
+                source='internal',
+                protect_primary_admin=True,
+                forbid_self_delete=False,
+                db=db,
+            )
+        except AccountDeleteError:
+            return False
 
 
 Auths = AuthsTable()  # singleton — module-level instance

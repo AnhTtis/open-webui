@@ -7,8 +7,10 @@ from typing import Any
 
 from fastapi import HTTPException
 from open_webui.models.config import Config
-from open_webui.models.memories import Memories
+from open_webui.models.memories import Memories, parse_memory_vector_doc_id
+from open_webui.utils.access_control import has_permission
 from open_webui.utils.json_codec import JSONCodec
+from open_webui.utils.memory_limits import MEMORY_PROMPT_BYTE_CAP, MEMORY_PROMPT_ROW_CAP, utf8_bytes
 from open_webui.utils.misc import add_or_update_system_message, get_content_from_message
 
 log = logging.getLogger(__name__)
@@ -292,8 +294,17 @@ def model_allows_memory(model: dict | None) -> bool:
     return ((model or {}).get('info', {}).get('meta', {}).get('capabilities') or {}).get('memory', True)
 
 
+async def user_can_use_memories(user) -> bool:
+    config = await Config.get_many('memories.enable', 'user.permissions')
+    if not config.get('memories.enable'):
+        return False
+    if getattr(user, 'role', None) == 'admin':
+        return True
+    return await has_permission(user.id, 'features.memories', config.get('user.permissions'))
+
+
 async def add_memory_context(request, form_data: dict, user, model: dict | None = None):
-    if not model_allows_memory(model):
+    if not model_allows_memory(model) or not await user_can_use_memories(user):
         return form_data
 
     user_messages = []
@@ -312,7 +323,14 @@ async def add_memory_context(request, form_data: dict, user, model: dict | None 
     if not query:
         return form_data
 
-    all_memories = await Memories.get_memories_by_user_id(user.id)
+    metadata = getattr(request.state, 'metadata', {}) or {}
+    prompt_memories = await Memories.get_prompt_memories(
+        user.id,
+        session_id=metadata.get('session_id'),
+        chat_id=metadata.get('chat_id'),
+        row_cap=MEMORY_PROMPT_ROW_CAP,
+        byte_cap=MEMORY_PROMPT_BYTE_CAP,
+    )
     results = None
     try:
         from open_webui.routers.memories import QueryMemoryForm, query_memory
@@ -343,22 +361,27 @@ async def add_memory_context(request, form_data: dict, user, model: dict | None 
 
     sections = {'user': [], 'neighborhood': [], 'context': []}
     seen_ids = set()
-    memories_by_id = {memory.id: memory for memory in (all_memories or [])}
+    memories_by_id = {memory.id: memory for memory in (prompt_memories or [])}
     stable_user_memories = sorted(
-        [memory for memory in (all_memories or []) if memory.type == 'user'],
+        [memory for memory in (prompt_memories or []) if memory.type == 'user'],
         key=lambda item: (
             -float(getattr(item, 'importance', 0.5) or 0.5),
             -(item.updated_at or 0),
             item.id or '',
         ),
-    )[:20]
+    )
+    used_bytes = 0
     for memory in stable_user_memories:
+        size = int(getattr(memory, 'content_bytes', 0) or utf8_bytes(memory.content))
+        if used_bytes + size > MEMORY_PROMPT_BYTE_CAP:
+            break
         seen_ids.add(memory.id)
         sections['user'].append(memory_record(memory))
+        used_bytes += size
 
-    for hint in memory_path_hints(query, all_memories):
+    for hint in memory_path_hints(query, prompt_memories):
         for memory in search_memory_rows(
-            all_memories,
+            prompt_memories,
             path=hint,
             memory_type='context',
             limit=4,
@@ -369,13 +392,26 @@ async def add_memory_context(request, form_data: dict, user, model: dict | None 
             sections['neighborhood'].append(memory_record(memory))
 
     if results and hasattr(results, 'ids') and results.ids:
-        for doc_idx, memory_id in enumerate(results.ids[0] or []):
+        hit_ids = []
+        for raw_id in results.ids[0] or []:
+            _generation, memory_id, _revision = parse_memory_vector_doc_id(raw_id)
+            if memory_id and memory_id not in seen_ids:
+                hit_ids.append(memory_id)
+        if hit_ids:
+            canonical = await Memories.get_memories_by_ids(
+                user.id,
+                hit_ids,
+                eligible_only=True,
+                session_id=metadata.get('session_id'),
+                chat_id=metadata.get('chat_id'),
+            )
+            memories_by_id.update({memory.id: memory for memory in canonical})
+        for doc_idx, raw_id in enumerate(results.ids[0] or []):
+            _generation, memory_id, _revision = parse_memory_vector_doc_id(raw_id)
             if not memory_id or memory_id in seen_ids:
                 continue
-            # Always cross-check the vector hit against current SQL state so a
-            # stale vector cannot reintroduce archived or deleted content.
             memory = memories_by_id.get(memory_id)
-            if not memory or getattr(memory, 'status', 'active') not in {'active', 'candidate'}:
+            if not memory or getattr(memory, 'status', 'active') != 'active':
                 continue
             seen_ids.add(memory_id)
             score = None
@@ -445,7 +481,7 @@ async def review_memory_after_turn(
     assistant_message: dict,
     messages: list[dict],
 ) -> None:
-    if not model_allows_memory(model):
+    if not model_allows_memory(model) or not await user_can_use_memories(user):
         return
 
     features = metadata.get('features') or {}
@@ -518,10 +554,10 @@ async def _review_memory(
     assistant_message: dict,
     messages: list[dict],
 ) -> None:
-    existing_memories = await Memories.get_memories_by_user_id(user.id)
+    existing_memories = await Memories.get_extraction_snapshot(user.id)
     existing_lines = [
         f'- id={memory.id} type={memory.type} path={memory.path or ""} content={memory.content}'
-        for memory in (existing_memories or [])[:80]
+        for memory in existing_memories
     ]
 
     assistant_content = get_content_from_message(assistant_message)

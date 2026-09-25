@@ -819,28 +819,17 @@ async def delete_user(
     db: AsyncSession = Depends(get_async_session),
 ):
     """Delete SCIM User"""
-    user = await Users.get_scim_user_by_id(user_id, db=db)
-    if not user:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f'User {user_id} not found',
-        )
+    from open_webui.services.account_lifecycle import delete_account_or_raise
 
-    success = await Users.delete_user_by_id(user_id, db=db)
-    if not success:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail='Failed to delete user',
-        )
-
-    await publish_event(
-        request,
-        EVENTS.USER_DELETED,
-        subject_id=user_id,
+    await delete_account_or_raise(
+        user_id,
+        request=request,
         source='scim',
-        data={'email': user.email},
+        protect_primary_admin=True,
+        forbid_self_delete=False,
+        require_scim_user=True,
+        db=db,
     )
-
     return None
 
 

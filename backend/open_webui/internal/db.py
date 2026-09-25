@@ -18,8 +18,10 @@ from open_webui.env import (
     DATABASE_POOL_SIZE,
     DATABASE_POOL_TIMEOUT,
     DATABASE_SCHEMA,
+    DATABASE_SQLITE_ASYNC_POOL_SIZE,
     DATABASE_SQLITE_PRAGMA_BUSY_TIMEOUT,
     DATABASE_SQLITE_PRAGMA_CACHE_SIZE,
+    DATABASE_SQLITE_PRAGMA_FOREIGN_KEYS,
     DATABASE_SQLITE_PRAGMA_JOURNAL_SIZE_LIMIT,
     DATABASE_SQLITE_PRAGMA_MMAP_SIZE,
     DATABASE_SQLITE_PRAGMA_SYNCHRONOUS,
@@ -268,6 +270,76 @@ def _create_async_engine(*args, **kwargs):
     return create_async_engine(*args, **_json_codec_kwargs(kwargs))
 
 
+def _apply_sqlite_pragmas(dbapi_connection):
+    """Apply all configured SQLite PRAGMAs to a raw DBAPI connection.
+
+    ``PRAGMA foreign_keys=ON`` is required on every connection; SQLite
+    otherwise ignores ON DELETE CASCADE. Disk-first temp_store/mmap/cache
+    defaults keep the working set bounded.
+    """
+    # SQLite LIKE folds ASCII only; SQLAlchemy SQLite ILIKE compiles to lower(x) LIKE lower(?).
+    compiled_patterns = {}
+
+    def like(pattern, value, escape=None):
+        if pattern is None or value is None:
+            return None
+
+        pattern = str(pattern).lower()
+        escape = str(escape).lower() if escape is not None else None
+        key = (pattern, escape)
+        compiled = compiled_patterns.get(key)
+        if compiled is False:
+            return False
+        if compiled is None:
+            regex = []
+            escaped = False
+            for char in pattern:
+                if escape and not escaped and char == escape:
+                    escaped = True
+                    continue
+                regex.append(
+                    '.*' if not escaped and char == '%' else '.' if not escaped and char == '_' else re.escape(char)
+                )
+                escaped = False
+            if escaped:
+                compiled = False
+                if len(compiled_patterns) >= 512:
+                    compiled_patterns.clear()
+                compiled_patterns[key] = compiled
+                return False
+            compiled = re.compile(''.join(regex), re.DOTALL)
+            if len(compiled_patterns) >= 512:
+                compiled_patterns.clear()
+            compiled_patterns[key] = compiled
+
+        return compiled.fullmatch(str(value).lower()) is not None
+
+    dbapi_connection.create_function('like', 2, like, deterministic=True)
+    dbapi_connection.create_function('like', 3, like, deterministic=True)
+    cursor = dbapi_connection.cursor()
+    if DATABASE_SQLITE_PRAGMA_FOREIGN_KEYS:
+        cursor.execute(f'PRAGMA foreign_keys={DATABASE_SQLITE_PRAGMA_FOREIGN_KEYS}')
+    if DATABASE_ENABLE_SQLITE_WAL:
+        cursor.execute('PRAGMA journal_mode=WAL')
+    else:
+        cursor.execute('PRAGMA journal_mode=DELETE')
+
+    # Each remaining PRAGMA is skipped when its env var is empty, allowing opt-out.
+    if DATABASE_SQLITE_PRAGMA_SYNCHRONOUS:
+        cursor.execute(f'PRAGMA synchronous={DATABASE_SQLITE_PRAGMA_SYNCHRONOUS}')
+    if DATABASE_SQLITE_PRAGMA_BUSY_TIMEOUT:
+        cursor.execute(f'PRAGMA busy_timeout={DATABASE_SQLITE_PRAGMA_BUSY_TIMEOUT}')
+    if DATABASE_SQLITE_PRAGMA_CACHE_SIZE:
+        cursor.execute(f'PRAGMA cache_size={DATABASE_SQLITE_PRAGMA_CACHE_SIZE}')
+    if DATABASE_SQLITE_PRAGMA_TEMP_STORE:
+        cursor.execute(f'PRAGMA temp_store={DATABASE_SQLITE_PRAGMA_TEMP_STORE}')
+    if DATABASE_SQLITE_PRAGMA_MMAP_SIZE:
+        cursor.execute(f'PRAGMA mmap_size={DATABASE_SQLITE_PRAGMA_MMAP_SIZE}')
+    if DATABASE_SQLITE_PRAGMA_JOURNAL_SIZE_LIMIT:
+        cursor.execute(f'PRAGMA journal_size_limit={DATABASE_SQLITE_PRAGMA_JOURNAL_SIZE_LIMIT}')
+    cursor.close()
+
+
 # ============================================================
 # SYNC ENGINE (used only for: startup migrations, config loading,
 #              Alembic, peewee migration, health checks)
@@ -288,6 +360,7 @@ if SQLALCHEMY_DATABASE_URL.startswith('sqlite+sqlcipher://'):
 
         conn = sqlcipher3.connect(db_path, check_same_thread=False)
         conn.execute(f"PRAGMA key = '{database_password}'")
+        _apply_sqlite_pragmas(conn)
         return conn
 
     # The dummy "sqlite://" URL would cause SQLAlchemy to auto-select
@@ -319,68 +392,6 @@ if SQLALCHEMY_DATABASE_URL.startswith('sqlite+sqlcipher://'):
 
 elif 'sqlite' in SQLALCHEMY_DATABASE_URL:
     engine = _create_engine(SQLALCHEMY_DATABASE_URL, connect_args={'check_same_thread': False})
-
-    def _apply_sqlite_pragmas(dbapi_connection):
-        """Apply all configured SQLite PRAGMAs to a raw DBAPI connection."""
-        # SQLite LIKE folds ASCII only; SQLAlchemy SQLite ILIKE compiles to lower(x) LIKE lower(?).
-        compiled_patterns = {}
-
-        def like(pattern, value, escape=None):
-            if pattern is None or value is None:
-                return None
-
-            pattern = str(pattern).lower()
-            escape = str(escape).lower() if escape is not None else None
-            key = (pattern, escape)
-            compiled = compiled_patterns.get(key)
-            if compiled is False:
-                return False
-            if compiled is None:
-                regex = []
-                escaped = False
-                for char in pattern:
-                    if escape and not escaped and char == escape:
-                        escaped = True
-                        continue
-                    regex.append(
-                        '.*' if not escaped and char == '%' else '.' if not escaped and char == '_' else re.escape(char)
-                    )
-                    escaped = False
-                if escaped:
-                    compiled = False
-                    if len(compiled_patterns) >= 512:
-                        compiled_patterns.clear()
-                    compiled_patterns[key] = compiled
-                    return False
-                compiled = re.compile(''.join(regex), re.DOTALL)
-                if len(compiled_patterns) >= 512:
-                    compiled_patterns.clear()
-                compiled_patterns[key] = compiled
-
-            return compiled.fullmatch(str(value).lower()) is not None
-
-        dbapi_connection.create_function('like', 2, like, deterministic=True)
-        dbapi_connection.create_function('like', 3, like, deterministic=True)
-        cursor = dbapi_connection.cursor()
-        if DATABASE_ENABLE_SQLITE_WAL:
-            cursor.execute('PRAGMA journal_mode=WAL')
-        else:
-            cursor.execute('PRAGMA journal_mode=DELETE')
-
-        # Each PRAGMA is skipped when its env var is empty, allowing opt-out.
-        if DATABASE_SQLITE_PRAGMA_SYNCHRONOUS:
-            cursor.execute(f'PRAGMA synchronous={DATABASE_SQLITE_PRAGMA_SYNCHRONOUS}')
-        if DATABASE_SQLITE_PRAGMA_BUSY_TIMEOUT:
-            cursor.execute(f'PRAGMA busy_timeout={DATABASE_SQLITE_PRAGMA_BUSY_TIMEOUT}')
-        if DATABASE_SQLITE_PRAGMA_CACHE_SIZE:
-            cursor.execute(f'PRAGMA cache_size={DATABASE_SQLITE_PRAGMA_CACHE_SIZE}')
-        if DATABASE_SQLITE_PRAGMA_TEMP_STORE:
-            cursor.execute(f'PRAGMA temp_store={DATABASE_SQLITE_PRAGMA_TEMP_STORE}')
-        if DATABASE_SQLITE_PRAGMA_MMAP_SIZE:
-            cursor.execute(f'PRAGMA mmap_size={DATABASE_SQLITE_PRAGMA_MMAP_SIZE}')
-        if DATABASE_SQLITE_PRAGMA_JOURNAL_SIZE_LIMIT:
-            cursor.execute(f'PRAGMA journal_size_limit={DATABASE_SQLITE_PRAGMA_JOURNAL_SIZE_LIMIT}')
-        cursor.close()
 
     def on_connect(dbapi_connection, connection_record):
         _apply_sqlite_pragmas(dbapi_connection)
@@ -444,10 +455,15 @@ if sys.platform == 'win32' and _is_postgres_url(DATABASE_URL):
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 if 'sqlite' in ASYNC_SQLALCHEMY_DATABASE_URL:
-    # Generous default — async coroutines + no session sharing = high connection demand.
+    # Bounded default — async coroutines + no session sharing still need several
+    # connections, but 512 reserved slots was an unbounded RAM ceiling.
     # No pool_pre_ping: a local SQLite file cannot drop connections, and the
     # ping costs a worker-thread hop plus a SELECT 1 on every checkout.
-    _sqlite_pool_size = DATABASE_POOL_SIZE if isinstance(DATABASE_POOL_SIZE, int) and DATABASE_POOL_SIZE > 0 else 512
+    _sqlite_pool_size = (
+        DATABASE_POOL_SIZE
+        if isinstance(DATABASE_POOL_SIZE, int) and DATABASE_POOL_SIZE > 0
+        else DATABASE_SQLITE_ASYNC_POOL_SIZE
+    )
     async_engine = _create_async_engine(
         ASYNC_SQLALCHEMY_DATABASE_URL,
         connect_args={'check_same_thread': False},

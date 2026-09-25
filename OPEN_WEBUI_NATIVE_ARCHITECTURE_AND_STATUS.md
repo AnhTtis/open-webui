@@ -1,10 +1,10 @@
 # Open WebUI native architecture and implementation status
 
-> Updated: 2026-09-11  
+> Updated: 2026-09-25  
 > Working branch: `claude/native-memory-stability`  
-> Scope: `D:\ClaudeExperience\Memory\open-webui`
+> Scope: native Open WebUI plus durable per-user memory hardening
 
-This is the canonical architecture and implementation-status document for the native Open WebUI work. For local data protection, see [OPEN_WEBUI_LOCAL_DATA_AND_PROTECTION.md](./OPEN_WEBUI_LOCAL_DATA_AND_PROTECTION.md). For unfinished production validation, see [OPEN_WEBUI_RELEASE_GATES.md](./OPEN_WEBUI_RELEASE_GATES.md).
+This is the canonical architecture and implementation-status document for the native Open WebUI work. For the file-level delta versus `origin/main` at `0a7c15832`, see [OPEN_WEBUI_NATIVE_MEMORY_CHANGELOG.md](./OPEN_WEBUI_NATIVE_MEMORY_CHANGELOG.md). For local data protection, see [OPEN_WEBUI_LOCAL_DATA_AND_PROTECTION.md](./OPEN_WEBUI_LOCAL_DATA_AND_PROTECTION.md). For unfinished production validation, see [OPEN_WEBUI_RELEASE_GATES.md](./OPEN_WEBUI_RELEASE_GATES.md).
 
 ## 1. Architecture decision
 
@@ -87,6 +87,8 @@ Native Open WebUI Skills and permissions remain active. No Hermes manifest or He
 
 ### Canonical schema
 
+Canonical memory lives on disk in SQL (PostgreSQL production / SQLite single-process compatibility) and a persistent vector backend. Application RAM is a bounded working set (page, top-K, batch, byte caps), not a full-user or full-install load, and not zero RAM.
+
 Migration `backend/open_webui/migrations/versions/e7a9c4d2b611_add_durable_memory_lifecycle.py` extends the existing `memory` table and creates:
 
 - `memory_revision`
@@ -98,6 +100,11 @@ Migration `backend/open_webui/migrations/versions/e7a9c4d2b611_add_durable_memor
 - `memory_proposal`
 - `memory_job`
 - `memory_audit_event`
+
+Follow-up migrations (do not rewrite `e7a9c4d2b611`):
+
+- `f8c2a91d4e73_add_memory_integrity_lifecycle.py` — quota ledger, vector generation/manifest, independent account-cleanup, live-hash unique index, job fencing, `content_bytes` / session / chat scope columns
+- `a9d3b70e5c14_add_memory_transfer_staging.py` — NDJSON v2 staging tables
 
 The current `memory` row stores scope (`session`, `working`, `long_term`), kind, structured value, normalized hash, lifecycle status, confidence/trust/importance, validity and expiry, recall counters, revision/version state and vector sync state.
 
@@ -119,7 +126,9 @@ The current `memory` row stores scope (`session`, `working`, `long_term`), kind,
 
 The Personalization UI now supports search/filter/pagination, active/candidate/archived/deleted views, proposal approval/dismissal, revision history, restore, optimistic-conflict feedback, learning pause/resume, export, import dry-run and explicit import confirmation.
 
-Import currently restores validated canonical rows without overwriting duplicates. Full historical backup restore remains a release gate.
+Import currently restores validated canonical rows without overwriting duplicates. JSON v1 is atomic and bounded; NDJSON v2 stages then publishes. Full historical backup restore on PostgreSQL with live vector backends remains a release gate.
+
+Administrators see quota config and aggregate health only. They do not browse memory content, paths, or user identifiers.
 
 ## 7. Office document preview and download
 
@@ -143,12 +152,17 @@ The original Office object is always canonical. Download preserves original byte
 Required feature files include:
 
 - `backend/open_webui/migrations/versions/e7a9c4d2b611_add_durable_memory_lifecycle.py`
+- `backend/open_webui/migrations/versions/f8c2a91d4e73_add_memory_integrity_lifecycle.py`
+- `backend/open_webui/migrations/versions/a9d3b70e5c14_add_memory_transfer_staging.py`
+- `backend/open_webui/services/account_lifecycle.py`
+- `backend/open_webui/utils/memory_limits.py`
 - `backend/open_webui/utils/context_budget.py`
 - `backend/open_webui/utils/memory_jobs.py`
 - `backend/open_webui/utils/office_preview.py`
 - `backend/open_webui/utils/reasoning_parser.py`
 - memory/file routers, models and middleware changes
 - `backend/tests/test_memory_*.py`
+- `src/lib/components/admin/Settings/Memory.svelte`
 - `backend/tests/test_context_budget.py`
 - `backend/tests/test_reasoning_parser.py`
 - `backend/tests/test_mcp_client.py`
@@ -168,8 +182,9 @@ Focused verification completed before this document was updated:
 - SQLite Alembic upgrade/downgrade/upgrade and legacy-memory backfill checks.
 - Memory lifecycle, optimistic concurrency, proposal claim, export/import and route tests.
 - Context-budget, reasoning parser, MCP timeout and Office conversion/route tests.
-- Combined backend pytest: **43 tests passed, 333 subtests passed**.
-- Focused frontend Vitest: **2 files, 10 tests passed**.
+- Combined backend pytest (2026-09-11 native-pipeline checkpoint): **43 tests passed, 333 subtests passed**.
+- Focused frontend Vitest (2026-09-11): **2 files, 10 tests passed**.
+- 2026-09-25 hardening tests (`backend/tests/test_memory_hardening.py` and extended `src/lib/apis/memories/index.test.ts`) were **not run** in this environment (no pytest/aiosqlite/Node). They are a release gate, not a pass.
 - Focused ESLint passes for the changed files API, Memory Center and Office preview files; IDE diagnostics are empty in that focused scope.
 - Office route tests verify denied users receive 404 before storage read and canonical XLSX bytes retain the same SHA-256.
 - Backend compile, focused Black/Prettier and `git diff --check` passed at the recorded checkpoint.
@@ -189,4 +204,4 @@ SQLite remains a local/development compatibility target. Canonical SQL data must
 
 ## 11. Repository status
 
-No commit or push has been requested or performed for this work. Before any release, review the complete diff, deletion inventory and release gates.
+Branch starting commit `34791a339` is already on `claude/native-memory-stability`. Hardening after that commit remains in the working tree. No further commit or push has been requested. Before any release, review the complete diff, [native memory changelog](./OPEN_WEBUI_NATIVE_MEMORY_CHANGELOG.md), deletion inventory and release gates.
