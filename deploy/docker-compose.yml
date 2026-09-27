@@ -1,0 +1,31 @@
+# Open WebUI on localai. Tunnel name stays `open-webui`.
+# Cloudflare public hostname: chat.ailib.io.vn -> http://127.0.0.1:18473
+# Host port 18473 on purpose (not 3000/8080). Container still listens on 8080.
+#
+# Live secrets: copy .env.example to .env (gitignored) or keep
+# /home/anhtri/open-webui-deploy/.env mode 600. Never commit .env.
+
+name: open-webui
+
+services:
+  open-webui:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      args:
+        USE_CUDA: 'false'
+        USE_OLLAMA: 'false'
+    image: open-webui-native:local
+    container_name: open-webui
+    restart: unless-stopped
+    ports:
+      - '127.0.0.1:18473:8080'
+    env_file:
+      - .env
+    volumes:
+      - open-webui-data:/app/backend/data
+    extra_hosts:
+      - host.docker.internal:host-gateway
+
+volumes:
+  open-webui-data:
