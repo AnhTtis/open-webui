@@ -267,19 +267,31 @@ async function downloadPyPIWheels(stagingDir) {
 	await writeFileAtomic(lockPath, `${JSON.stringify(lockData, null, 2)}\n`);
 }
 
+async function moveDirectory(src, dest) {
+	try {
+		await rename(src, dest);
+	} catch (error) {
+		if (error?.code !== 'EXDEV') {
+			throw error;
+		}
+		await cp(src, dest, { recursive: true });
+		await rm(src, { recursive: true, force: true });
+	}
+}
+
 async function replaceOutputDirectory(stagingDir) {
 	const backupDir = join(staticDir, `.pyodide.backup-${process.pid}-${Date.now()}`);
 	const hadExistingOutput = await pathExists(outputDir);
 
 	if (hadExistingOutput) {
-		await rename(outputDir, backupDir);
+		await moveDirectory(outputDir, backupDir);
 	}
 
 	try {
-		await rename(stagingDir, outputDir);
+		await moveDirectory(stagingDir, outputDir);
 	} catch (error) {
 		if (hadExistingOutput && !(await pathExists(outputDir))) {
-			await rename(backupDir, outputDir);
+			await moveDirectory(backupDir, outputDir);
 		}
 		throw error;
 	}

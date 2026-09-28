@@ -19,7 +19,7 @@ This directory is the recipe. The live secret file is **not** in git:
 - Copy `.env.example` → `deploy/.env` (gitignored), **or**
 - Keep `/home/anhtri/open-webui-deploy/.env` (mode 600)
 
-Never commit `WEBUI_SECRET_KEY`.
+Never commit `WEBUI_SECRET_KEY`. See `SECRETS_RESTORE.txt` for the private backup/restore location and exact paths to copy secrets back before the next deploy.
 
 ## Cloudflare dashboard
 
